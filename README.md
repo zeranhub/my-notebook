@@ -1,19 +1,21 @@
-# 我的笔记本
+# 一页纸
 
-这是一个无需安装的中文笔记网页。公开的 GitHub Pages 只托管界面；笔记数据保存在 `zeranhub/personal-notes-data` 私有仓库的 `data/notes.json` 中。网页使用 GitHub API 直接同步，因此每台设备首次使用都需要单独输入一个 GitHub fine-grained personal access token。
+这是一个通过 GitHub Pages 免费发布的私人笔记网页。每张纸都采用固定的 A4 纵向比例。观看模式把每篇笔记的完整正文放进独立文本框，自动安排在这张纸上；点击文本框进入编辑模式，直接修改纯文本正文，停笔后自动保存。没有笔记标题、文件夹或侧边栏。可建立多张一页纸，每张的面积都有限。
 
-## 首次使用
+文本框会按正文长度自动调整；拖动左上角手柄可移动，拖动右下角手柄可改变大小。若正文放不进当前纸张，页面会明确标出越界，并在纸张下方完整显示这些笔记，不会扩展纸张或截断正文。编辑时可选择“移到新页”。
 
-1. 打开 `https://zeranhub.github.io/my-notebook/`，点击页面里的 GitHub 令牌创建链接。
-2. Resource owner 选 `zeranhub`；Repository access 选 **Only select repositories**，仅选择 `personal-notes-data`；Repository permissions 中将 **Contents** 设置为 **Read and write**。生成后复制令牌，勿发到聊天或分享给他人。
-3. 回到笔记网页，粘贴令牌，设置该设备的 6 位 PIN。手机或其他电脑需要分别操作一次，之后它们使用同一个私有仓库同步。
+## 首次连接
 
-写作停止约数秒后自动同步；页面重新获得焦点时也会检查其他设备的修改。顶部显示同步状态。网络中断时，未同步内容会尝试加密保存在当前浏览器。遇到两台设备同时修改同一笔记，网页会保留冲突副本供你整理。可以用“导出备份”保存 JSON 文件；“导入 JSON”会保留现有笔记。
+1. 打开 [一页纸](https://zeranhub.github.io/my-notebook/)，使用网页中的链接创建 GitHub fine-grained personal access token。
+2. Resource owner 选 `zeranhub`；Repository access 选 **Only select repositories**，仅选 `personal-notes-data`；Repository permissions 中将 **Contents** 设为 **Read and write**。复制令牌，切勿发到聊天或分享给他人。
+3. 回到网页，粘贴令牌并设置这台设备的 6 位 PIN。手机或其他电脑各需配置一次，之后通过同一私有仓库自动同步。
 
-## 隐私边界
+公开仓库 `zeranhub/my-notebook` 只托管网页界面。正文保存在私有仓库 `zeranhub/personal-notes-data` 的 `data/notes.json`，不会发布到 GitHub Pages。编辑后约 2.5 秒开始同步；页面重新获得焦点或联网时会检查其他设备的更新。断网时修改会尝试加密保存在当前浏览器中；若两台设备同时修改同一篇笔记，系统会保留冲突副本。可用“备份”导出 JSON，用“导入”追加备份中的页面和笔记。
 
-GitHub Pages 的网页界面及其源代码对所有人可见，但未获授权的访客不能从私有仓库读取笔记。6 位 PIN 用来解锁本机保存的加密令牌和草稿，**不是网站的服务器登录密码**；它位数较少，不适合抵御设备数据被复制后的暴力猜测。真正的远端访问权限由私有仓库和限定该仓库权限的令牌提供。不要在笔记中保存账户密码、恢复码等高度敏感资料。令牌到期或撤销后，应创建新令牌并在网页里重新连接；重新连接前先确认没有待同步草稿，必要时先导出备份。
+## 隐私说明
+
+6 位 PIN 用来解锁本机加密保存的令牌和草稿，主要防止旁人随手打开网页，不能代替强密码或设备锁屏。远端正文的访问权由 GitHub 私有仓库和仅授权该仓库的令牌决定。令牌过期或撤销后，重新连接前请先确认没有待同步的草稿，必要时导出备份。
 
 ## 维护
 
-网页源码为 `index.html`、`styles.css`、`app.js` 和 `sync.js`，不依赖第三方脚本或构建工具。将这些文件放在公开仓库的 `main` 分支根目录，GitHub Pages 从 `main` 的 `/` 发布。私有笔记文件不可复制到公开仓库，也不可把令牌写入源码。
+网站由 `index.html`、`styles.css`、`app.js`、`layout.js`、`model.js`、`sync.js` 构成，不依赖第三方脚本或构建工具。GitHub Pages 从公开仓库 `main` 分支根目录发布。切勿把私有笔记文件或访问令牌提交到公开仓库。

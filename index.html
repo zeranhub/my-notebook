@@ -3,79 +3,81 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f7f6f2">
-  <meta name="description" content="连接私有 GitHub 仓库、跨设备同步的个人笔记本。">
+  <meta name="theme-color" content="#f6f5f1">
+  <meta name="description" content="一页纸：在私人纸张上自由摆放笔记，并同步到你的私有 GitHub 仓库。">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://api.github.com; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
-  <title>我的笔记本</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='8' y='5' width='48' height='54' rx='9' fill='%23245045'/%3E%3Cpath d='M20 21h24M20 31h24M20 41h15' stroke='white' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <title>一页纸</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='10' y='5' width='44' height='54' rx='5' fill='%23ffffff' stroke='%232f4e40' stroke-width='4'/%3E%3Cpath d='M20 23h24M20 33h21M20 43h16' stroke='%232f4e40' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
   <script src="sync.js" defer></script>
+  <script src="layout.js" defer></script>
+  <script src="model.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">▤</span><span>我的笔记本</span></div>
-      <div class="top-actions">
-        <span class="sync-status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">等待连接</span></span>
-        <button id="syncButton" class="button button-quiet" type="button">立即同步</button>
-        <button id="lockButton" class="button button-quiet" type="button">锁定</button>
-        <button id="importButton" class="button button-quiet" type="button">导入 JSON</button>
-        <button id="exportButton" class="button button-quiet" type="button">导出备份</button>
-        <input id="importFile" type="file" accept=".json,application/json" hidden>
+      <div class="topbar-main">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">▤</span><span>一页纸</span></div>
+        <nav class="page-navigation" aria-label="一页纸列表">
+          <div id="pageTabs" class="page-tabs" role="tablist" aria-label="切换一页纸"></div>
+          <button id="addPageButton" class="icon-button add-page-button" type="button" aria-label="新建一页纸" title="新建一页纸">＋</button>
+          <button id="renamePageButton" class="icon-button rename-page-button" type="button" aria-label="重命名当前页" title="重命名当前页">✎</button>
+        </nav>
+        <div class="topbar-actions">
+          <button id="newNoteButton" class="button button-primary" type="button">＋ 新建笔记</button>
+          <div class="sync-status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">等待连接</span></div>
+          <button id="syncButton" class="button button-quiet" type="button">同步</button>
+          <button id="lockButton" class="button button-quiet" type="button">锁定</button>
+          <div class="backup-actions">
+            <button id="importButton" class="button button-quiet" type="button">导入</button>
+            <button id="exportButton" class="button button-quiet" type="button">备份</button>
+            <input id="importFile" type="file" accept=".json,application/json" hidden>
+          </div>
+        </div>
       </div>
     </header>
 
-    <div class="workspace">
-      <aside class="sidebar" aria-label="笔记列表">
-        <div class="sidebar-heading">
-          <div><p class="eyebrow">个人空间</p><h1>笔记</h1></div>
-          <button id="newButton" class="button button-primary" type="button">＋ 新建</button>
-        </div>
-        <label class="search-box">
-          <span aria-hidden="true">⌕</span>
-          <span class="sr-only">搜索笔记标题、内容或标签</span>
-          <input id="searchInput" type="search" placeholder="搜索笔记…" autocomplete="off">
-        </label>
-        <div class="filter-heading"><span>标签</span><button id="clearTagButton" class="text-button" type="button" hidden>清除筛选</button></div>
-        <div id="tagFilters" class="tag-filters" aria-label="按标签筛选"></div>
-        <div class="list-heading"><span>全部笔记</span><span id="noteCount">0</span></div>
-        <div id="noteList" class="note-list"></div>
-      </aside>
-
-      <main class="main-panel" id="mainPanel">
-        <div class="editor-top">
-          <div class="editor-breadcrumb">笔记 <span aria-hidden="true">/</span> <span id="currentBreadcrumb">未命名笔记</span></div>
-          <button id="deleteButton" class="button button-danger" type="button">删除笔记</button>
-        </div>
-        <div class="editor-fields">
-          <label class="sr-only" for="titleInput">笔记标题</label>
-          <input id="titleInput" class="title-input" type="text" placeholder="未命名笔记" maxlength="160" autocomplete="off">
-          <div class="editor-meta"><span id="updatedLabel"></span><span class="meta-dot" aria-hidden="true">·</span><span id="saveLabel">等待同步</span></div>
-          <label class="tag-edit"><span>标签</span><input id="tagInput" type="text" placeholder="输入标签，用逗号分隔" autocomplete="off"></label>
-        </div>
-        <div class="content-toolbar">
-          <div class="view-tabs" role="tablist" aria-label="内容视图">
-            <button id="editTab" class="view-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="editPane">编辑</button>
-            <button id="previewTab" class="view-tab" type="button" role="tab" aria-selected="false" aria-controls="previewPane">预览</button>
+    <main class="main-content">
+      <section id="viewMode" class="view-mode" aria-label="观看一页纸" hidden>
+        <div class="paper-context"><span>我的一页纸</span><span class="paper-context-rule" aria-hidden="true"></span><span id="viewCapacityLabel">这张纸还有空间</span></div>
+        <div class="paper-wrap">
+          <div id="canvasViewport" class="canvas-viewport">
+            <div class="paper-stage">
+              <div id="canvas" class="paper-canvas" aria-label="当前纸张上的笔记"></div>
+              <div id="overflowBadge" class="overflow-badge" role="status" hidden>纸张之外还有笔记 ↓</div>
+            </div>
           </div>
-          <span class="markdown-hint">支持 Markdown 基本格式</span>
         </div>
-        <div class="content-panes" data-view="edit">
-          <section id="editPane" class="content-pane edit-pane" role="tabpanel" aria-labelledby="editTab">
-            <label class="sr-only" for="contentInput">笔记内容</label>
-            <textarea id="contentInput" placeholder="从这里开始写。可以用 # 标题、**加粗**、- 列表……" spellcheck="true"></textarea>
-          </section>
-          <section id="previewPane" class="content-pane preview-pane" role="tabpanel" aria-labelledby="previewTab">
-            <div id="previewContent" class="markdown-body"></div>
-          </section>
+        <section id="overflowArea" class="overflow-area" aria-label="纸张边界外的笔记" hidden></section>
+      </section>
+
+      <section id="editMode" class="edit-mode" aria-label="编辑笔记" hidden>
+        <div class="editor-panel">
+          <div class="editor-toolbar">
+            <button id="backButton" class="button button-back" type="button"><span aria-hidden="true">←</span> 返回纸张</button>
+            <span id="editorStatus" class="editor-status" role="status" aria-live="polite"></span>
+          </div>
+          <label class="sr-only" for="editorContent">笔记正文</label>
+          <textarea id="editorContent" class="editor-content" placeholder="写下你的想法……" spellcheck="true" maxlength="2000000"></textarea>
+          <div class="editor-footer">
+            <div class="editor-capacity">
+              <span id="capacityLabel">这张纸还有空间</span>
+              <span id="editorOverflow" class="editor-overflow" role="status" hidden>正文超出当前纸张，将在纸张外完整显示。</span>
+            </div>
+            <div class="editor-actions">
+              <button id="moveToNewPageButton" class="button button-quiet" type="button">移到新页</button>
+              <button id="deleteButton" class="button button-danger" type="button">删除笔记</button>
+            </div>
+          </div>
         </div>
-      </main>
-    </div>
-    <footer class="privacy-note">笔记同步到你的私有 GitHub 仓库。6 位 PIN 只用于解锁这台设备上的访问凭据；请妥善保管令牌并定期导出备份。</footer>
+      </section>
+    </main>
+    <footer class="privacy-note">笔记同步到你的私有 GitHub 仓库。6 位 PIN 只用于解锁这台设备上的访问凭据。</footer>
   </div>
+
   <dialog id="accessDialog" class="access-dialog" aria-labelledby="accessTitle">
-    <div class="access-header"><span class="access-icon" aria-hidden="true">▤</span><span>我的笔记本</span></div>
+    <div class="access-header"><span class="access-icon" aria-hidden="true">▤</span><span>一页纸</span></div>
     <form id="setupView" class="access-view" autocomplete="off">
       <p class="eyebrow">首次使用</p>
       <h2 id="accessTitle">连接你的私有笔记</h2>
@@ -96,13 +98,13 @@
           <input id="confirmPinInput" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" minlength="6" placeholder="确认 PIN" required autocomplete="new-password">
         </label>
       </div>
-      <button id="setupButton" class="button button-primary access-submit" type="submit">连接并进入笔记本</button>
+      <button id="setupButton" class="button button-primary access-submit" type="submit">连接并进入一页纸</button>
       <p id="setupError" class="access-error" role="alert" hidden></p>
       <p class="access-small">PIN 只在此设备使用，主要防止别人随手打开，不适合保护特别敏感的资料。换设备时，需要再次输入 GitHub 令牌并设置该设备的 PIN。</p>
     </form>
     <form id="unlockView" class="access-view" autocomplete="off" hidden>
       <p class="eyebrow">欢迎回来</p>
-      <h2>解锁笔记本</h2>
+      <h2>解锁一页纸</h2>
       <p class="access-intro">输入这台设备的 6 位 PIN，继续同步私有笔记。</p>
       <label class="access-field">6 位 PIN
         <input id="pinInput" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" minlength="6" placeholder="输入 6 位数字" required autocomplete="current-password">
