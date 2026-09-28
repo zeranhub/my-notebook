@@ -75,11 +75,13 @@
   let imageBusy = false;
   let zoom = "fit";
   // A Windows computer can report touch hardware while its active pointer is a mouse.
-  const touchDevice = matchMedia("(pointer: coarse)").matches;
+  let touchDevice = matchMedia("(pointer: coarse)").matches;
   document.body.classList.toggle("is-touch-device", touchDevice);
   let selectedNoteId = null;
   let activeMoveCleanup = null;
   let paperGesture = null;
+  let activePaperDrag = null;
+  let pendingMouseCleanup = null;
   let deferredView = false;
   let longPressTimer = null;
   let navigationId = crypto.randomUUID();
@@ -611,8 +613,20 @@
     positionTouchTools();
   }
 
-  function selectNote(id) {
-    selectedNoteId = touchDevice ? id : null;
+  function selectNote(id, persistLayer = true) {
+    const previous = selectedNoteId;
+    selectedNoteId = id;
+    const note = byId(id);
+    if (persistLayer && id !== previous && note && mode === "view" && note.pageId === viewPageId) {
+      const card = [...ui.canvas.children].find(item => item.dataset.noteId === id);
+      const behindPeer = card && [...ui.canvas.children].some(item =>
+        item.dataset.noteKind === card.dataset.noteKind && Number(item.style.zIndex) > Number(card.style.zIndex));
+      if (behindPeer) {
+        raiseNoteLayer(note);
+        note.updatedAt = now();
+        changed();
+      }
+    }
     updateTouchSelection();
   }
 
@@ -626,6 +640,7 @@
     ui.touchNoteHandles.hidden = !touchDevice || !selectedNoteId;
     const onPaper = lastLayout.placed.some(rect => rect.id === selectedNoteId);
     ui.touchWidthHandle.disabled = ui.touchScaleHandle.disabled = !onPaper;
+    updateCardLayers(selectedNoteId);
     positionTouchTools();
   }
 
@@ -682,21 +697,41 @@
   }
 
   function beginPaperGesture(event) {
-    if (!touchDevice || event.pointerType !== "touch" || !unlocked || mode !== "view" || activeMoveCleanup) return;
+    if (event.pointerType !== "touch" || !unlocked || mode !== "view") return;
+    if (event.target.closest("button") || paperPointers.has(event.pointerId)) return;
+    if (activeMoveCleanup && !activePaperDrag) return;
+    // Cancel the browser's image callout at the initial contact, before a
+    // native long-press menu can win the gesture. Touchstart has the same guard.
+    event.preventDefault();
+    if (!touchDevice) {
+      touchDevice = true;
+      document.body.classList.add("is-touch-device");
+      updateTouchSelection();
+    }
+    if (activePaperDrag) {
+      // A second finger always switches a body drag to paper zoom. The first
+      // drag has not committed yet, so restore its saved geometry first.
+      activeMoveCleanup?.();
+      activePaperDrag = null;
+      renderView();
+      const [first] = paperPointers.values();
+      paperGesture = { target: ui.paperViewport, startX: first.x, startY: first.y,
+        left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: true, pinched: false };
+      for (const pointerId of paperPointers.keys()) ui.paperViewport.setPointerCapture(pointerId);
+    }
     paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (paperPointers.size === 1) {
-      paperGesture = { target: event.target, down: event, startX: event.clientX, startY: event.clientY,
-        left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: false, pinched: false };
       const card = event.target.closest(".note-card");
-      if (card) longPressTimer = setTimeout(() => {
+      paperGesture = { target: event.target, down: event, startX: event.clientX, startY: event.clientY,
+        left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: false, pinched: false,
+        noteId: card?.dataset.noteId || null, canDrag: card?.dataset.noteId === selectedNoteId };
+      if (card && !paperGesture.canDrag) longPressTimer = setTimeout(() => {
         longPressTimer = null;
         if (!paperGesture || paperGesture.moved || paperGesture.pinched || paperPointers.size !== 1) return;
         const note = byId(card.dataset.noteId);
         if (!note) return;
-        selectNote(note.id);
-        paperPointers.clear();
-        paperGesture = null;
-        beginMove(event, note, card, "drag");
+        selectNote(note.id, false);
+        startPaperNoteDrag(event, note, card);
       }, 420);
     } else if (paperPointers.size === 2) {
       clearTimeout(longPressTimer); longPressTimer = null;
@@ -710,10 +745,20 @@
     ui.paperViewport.setPointerCapture(event.pointerId);
   }
 
+  function startPaperNoteDrag(event, note, card, firstMove = null) {
+    const previous = paperGesture;
+    clearTimeout(longPressTimer); longPressTimer = null;
+    paperGesture = null;
+    activePaperDrag = { pointerId: event.pointerId, noteId: note.id };
+    beginMove(event, note, card, "drag", firstMove);
+    if (!activeMoveCleanup) { activePaperDrag = null; paperGesture = previous; }
+  }
+
   function movePaperGesture(event) {
-    if (!paperPointers.has(event.pointerId) || !paperGesture) return;
-    event.preventDefault();
+    if (!paperPointers.has(event.pointerId)) return;
     paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (!paperGesture) return;
+    event.preventDefault();
     if (paperPointers.size === 2) {
       const [a, b] = [...paperPointers.values()];
       zoom = String(Math.max(fitScale(), Math.min(4,
@@ -725,6 +770,14 @@
       if (Math.hypot(dx, dy) > 6) {
         paperGesture.moved = true;
         clearTimeout(longPressTimer); longPressTimer = null;
+        if (paperGesture.canDrag && !paperGesture.pinched) {
+          const note = byId(paperGesture.noteId);
+          const card = [...ui.canvas.children].find(item => item.dataset.noteId === paperGesture.noteId);
+          if (note && card) {
+            startPaperNoteDrag(paperGesture.down, note, card, event);
+            return;
+          }
+        }
       }
       if (paperGesture.moved || paperGesture.pinched) {
         ui.paperViewport.scrollLeft = paperGesture.left - dx;
@@ -735,7 +788,12 @@
   }
 
   function endPaperGesture(event) {
-    if (!paperPointers.has(event.pointerId) || !paperGesture) return;
+    if (!paperPointers.has(event.pointerId)) return;
+    if (!paperGesture) {
+      paperPointers.delete(event.pointerId);
+      if (activePaperDrag?.pointerId === event.pointerId) activePaperDrag = null;
+      return;
+    }
     const gesture = paperGesture;
     clearTimeout(longPressTimer); longPressTimer = null;
     paperPointers.delete(event.pointerId);
@@ -757,12 +815,46 @@
     if (deferredView) { deferredView = false; if (mode === "view") renderView(); }
   }
 
+  function beginMouseNoteGesture(event, note, card, overflow) {
+    if (event.pointerType === "touch" || event.button !== 0 || overflow ||
+        !unlocked || mode !== "view" || selectedNoteId !== note.id ||
+        activeMoveCleanup || paperGesture || pendingMouseCleanup || event.target.closest("button")) return;
+    if (event.target.closest("a") && (event.ctrlKey || event.metaKey)) return;
+    event.preventDefault();
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      card.removeEventListener("lostpointercapture", lost);
+      if (pendingMouseCleanup === cleanup) pendingMouseCleanup = null;
+      if (card.hasPointerCapture(event.pointerId)) card.releasePointerCapture(event.pointerId);
+      // Let the release's click finish before replacing its target. A real
+      // drag installs activeMoveCleanup before this frame and owns the redraw.
+      if (deferredView) requestAnimationFrame(() => {
+        if (deferredView && mode === "view" && !paperGesture && !activeMoveCleanup && !pendingMouseCleanup) renderView();
+      });
+    };
+    const move = moved => {
+      if (moved.pointerId !== event.pointerId || Math.hypot(moved.clientX - event.clientX, moved.clientY - event.clientY) <= 6) return;
+      cleanup();
+      beginMove(event, byId(note.id) || note, card, "drag", moved);
+    };
+    const up = released => { if (released.pointerId === event.pointerId) cleanup(); };
+    const lost = released => { if (released.pointerId === event.pointerId) cleanup(); };
+    card.setPointerCapture(event.pointerId);
+    pendingMouseCleanup = cleanup;
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    card.addEventListener("lostpointercapture", lost);
+  }
+
   function createCard(note, rect, overflow = false) {
     const card = document.createElement("article");
     card.className = `note-card${overflow ? " is-overflow" : ""}${note.conflictOf ? " is-conflict" : ""}`;
     card.tabIndex = 0;
     card.setAttribute("role", "button");
-    card.setAttribute("aria-label", overflow ? "编辑纸张外的笔记" : "编辑笔记");
+    card.setAttribute("aria-label", overflow ? "选中纸张外的笔记，再次点击编辑" : "选中笔记，再次点击编辑");
     card.dataset.noteId = note.id;
     if (!overflow) {
       card.style.left = `${rect.x}px`;
@@ -825,16 +917,25 @@
       resize.addEventListener("click", event => event.stopPropagation());
       card.append(resize);
     }
-    card.addEventListener("click", () => {
+    card.addEventListener("pointerdown", event => beginMouseNoteGesture(event, note, card, overflow), { capture: true });
+    card.addEventListener("touchstart", event => {
+      if (!overflow && unlocked && mode === "view") event.preventDefault();
+    }, { capture: true, passive: false });
+    card.addEventListener("contextmenu", event => event.preventDefault());
+    card.addEventListener("dragstart", event => event.preventDefault());
+    card.addEventListener("click", event => {
+      if (event.target.closest("button")) return;
+      if (event.target.closest("a") && (event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      event.stopPropagation();
       if (Date.now() < suppressClickUntil) return;
-      if (touchDevice) tapNote(note.id);
-      else enterEdit(note.id);
-    });
+      tapNote(note.id);
+    }, { capture: true });
     card.addEventListener("keydown", event => {
       if (event.target !== card) return;
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        enterEdit(note.id);
+        tapNote(note.id);
       }
     });
     return card;
@@ -844,7 +945,7 @@
     return Number.isSafeInteger(note?.layer) && note.layer >= 0 ? note.layer : 0;
   }
 
-  function updateCardLayers(frontId = null) {
+  function updateCardLayers(frontId = selectedNoteId) {
     const cards = [...ui.canvas.children];
     const index = new Map(cards.map((card, position) => [card, position]));
     const notes = new Map(state.notes.map(note => [note.id, note]));
@@ -887,7 +988,8 @@
 
   function renderView() {
     if (!unlocked) return;
-    if (paperGesture || activeMoveCleanup) { deferredView = true; return; }
+    if (paperGesture || activeMoveCleanup || pendingMouseCleanup) { deferredView = true; return; }
+    deferredView = false;
     ensurePage();
     const page = currentPage();
     const result = layoutPage(page.id);
@@ -974,7 +1076,7 @@
     viewPageId = note.pageId;
     editingId = id;
     editingWasNew = isNew;
-    selectedNoteId = touchDevice ? id : null;
+    selectedNoteId = id;
     mode = "edit";
     ui.touchNoteHandles.hidden = true;
     if (!fromNavigation) window.history.pushState({ onePage: {
@@ -1018,6 +1120,8 @@
     if (!page || note.pageId !== page.id) return;
     const placed = lastLayout.placed.find(rect => rect.id === note.id);
     if (!placed) return;
+    selectedNoteId = note.id;
+    updateTouchSelection();
     const start = { x: placed.x, y: placed.y, w: placed.w, h: placed.h };
     const origin = { x: event.clientX, y: event.clientY };
     const moveScale = currentScale;
@@ -1105,7 +1209,7 @@
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
       activeMoveCleanup = null;
-      if (event.target.hasPointerCapture?.(event.pointerId)) event.target.releasePointerCapture(event.pointerId);
+      if (card.hasPointerCapture?.(event.pointerId)) card.releasePointerCapture(event.pointerId);
       card.classList.remove("is-moving");
     };
     const onUp = up => {
@@ -1131,7 +1235,7 @@
       deferredView = false;
     };
     activeMoveCleanup = cleanup;
-    event.target.setPointerCapture?.(event.pointerId);
+    card.setPointerCapture?.(event.pointerId);
     window.addEventListener("pointermove", onMove, { passive: false });
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
@@ -1222,10 +1326,10 @@
     }
     if (mode === "edit") {
       viewPageId = byId(editingId).pageId;
-      selectedNoteId = touchDevice ? editingId : null;
+      selectedNoteId = editingId;
     } else {
       if (pageById(selection.pageId)) viewPageId = selection.pageId;
-      selectedNoteId = touchDevice ? byId(selection.noteId)?.id || null : null;
+      selectedNoteId = byId(selection.noteId)?.id || null;
     }
     applyingHistory = true;
     changed();
@@ -1413,7 +1517,9 @@
     unlocked = false;
     journal.reset(); historyBefore = historySelectionBefore = null;
     clearTimeout(longPressTimer); longPressTimer = null;
+    pendingMouseCleanup?.();
     activeMoveCleanup?.();
+    activePaperDrag = null;
     paperPointers.clear();
     paperGesture = null;
     deferredView = false;
@@ -1648,7 +1754,13 @@
     zoom = ui.zoomSelect.value;
     if (unlocked && mode === "view") { updatePaperScale(anchor); savePageView(); }
   });
-  ui.paperViewport.addEventListener("pointerdown", beginPaperGesture);
+  ui.paperViewport.addEventListener("pointerdown", beginPaperGesture, { capture: true });
+  ui.paperViewport.addEventListener("touchstart", event => {
+    if (unlocked && mode === "view") event.preventDefault();
+  }, { capture: true, passive: false });
+  ui.paperViewport.addEventListener("click", event => {
+    if (unlocked && mode === "view" && !event.target.closest(".note-card") && Date.now() >= suppressClickUntil) selectNote(null);
+  });
   ui.paperViewport.addEventListener("pointermove", movePaperGesture, { passive: false });
   ui.paperViewport.addEventListener("pointerup", endPaperGesture);
   ui.paperViewport.addEventListener("pointercancel", endPaperGesture);
