@@ -8,6 +8,9 @@
  * API: new NotebookSync({ owner, repo, path }); isConfigured();
  * setup(pin, token); unlock(pin); lock(); load(); save(notes, sha);
  * saveDraft(value); loadDraft(); clearDraft(); validateToken(token); forget().
+ * uploadAsset(asset, Uint8Array | ArrayBuffer); loadAsset(asset) -> Uint8Array.
+ * Asset metadata contains id, path, mime, width, height, name. The path must be
+ * assets/<id>.<png|jpg|webp>; image bytes never receive a public download URL.
  * Draft methods round-trip any JSON value and keep it encrypted on this device.
  * Promise methods reject with an Error whose
  * code is a stable string such as UNAUTHORIZED, FORBIDDEN, NOT_FOUND, or
@@ -22,6 +25,7 @@
   // GitHub's Contents API stops returning Base64 content for files above 1 MB.
   const MAX_CONTENT_BYTES = 1_000_000;
   const STORAGE_VERSION = 1;
+  const IMAGE_EXTENSIONS = Object.freeze({ "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" });
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -50,6 +54,36 @@
       throw syncError("INVALID_TOKEN", "请输入 GitHub 访问令牌。");
     }
     return token.trim();
+  }
+
+  function requireAsset(asset) {
+    const id = asset?.id;
+    const extension = Object.hasOwn(IMAGE_EXTENSIONS, asset?.mime) ? IMAGE_EXTENSIONS[asset.mime] : null;
+    if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(id) ||
+        ["constructor", "prototype", "__proto__"].includes(id) || !extension ||
+        asset.path !== `assets/${id}.${extension}` ||
+        ![asset.width, asset.height].every(value => Number.isInteger(value) && value >= 1 && value <= 30_000) ||
+        (asset.name !== undefined && (typeof asset.name !== "string" || asset.name.length > 255))) {
+      throw syncError("INVALID_ASSET", "图片格式、尺寸或私有仓库路径有误。");
+    }
+    return { id, path: asset.path, mime: asset.mime, width: asset.width, height: asset.height,
+      name: asset.name === undefined ? id : asset.name };
+  }
+
+  function requireImageBytes(value, mime) {
+    let bytes;
+    if (value instanceof Uint8Array) bytes = new Uint8Array(value);
+    else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value.slice(0));
+    else throw syncError("INVALID_ASSET", "图片必须提供二进制文件内容。");
+    if (bytes.length > MAX_CONTENT_BYTES) throw syncError("TOO_LARGE", "每张图片最多 1 MB，请先缩小图片。");
+    const isPng = bytes.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte);
+    const isJpeg = bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+    const isWebp = bytes.length >= 12 && [82, 73, 70, 70].every((byte, index) => bytes[index] === byte) &&
+      [87, 69, 66, 80].every((byte, index) => bytes[index + 8] === byte);
+    if (!(mime === "image/png" && isPng || mime === "image/jpeg" && isJpeg || mime === "image/webp" && isWebp)) {
+      throw syncError("INVALID_ASSET", "图片文件内容与格式不符。");
+    }
+    return bytes;
   }
 
   function bytesToBase64(bytes) {
@@ -115,6 +149,8 @@
     #contentUrl;
     #context;
     #draftContext;
+    #pendingRequests = new Set();
+    #responseContexts = new WeakMap();
 
     constructor({ owner, repo, path } = {}) {
       if (typeof owner !== "string" || !/^[A-Za-z0-9-]+$/.test(owner) ||
@@ -215,12 +251,22 @@
     lock() {
       this.#token = null;
       this.#key = null;
+      for (const controller of this.#pendingRequests) controller.abort();
+      this.#pendingRequests.clear();
     }
 
     async #fetch(url, token, options = {}) {
+      const controller = new AbortController();
+      this.#pendingRequests.add(controller);
+      const timer = setTimeout(() => controller.abort(), 30_000);
+      const release = () => {
+        clearTimeout(timer);
+        this.#pendingRequests.delete(controller);
+      };
       try {
-        return await fetch(url, {
+        const response = await fetch(url, {
           ...options,
+          signal: controller.signal,
           cache: "no-store",
           credentials: "omit",
           redirect: "error",
@@ -232,16 +278,33 @@
             ...options.headers
           }
         });
+        // Keep timeout/lock cancellation active while the JSON response body
+        // is read, including servers that send headers then stall the body.
+        if (response.ok) this.#responseContexts.set(response, { controller, release });
+        else release();
+        return response;
       } catch {
+        release();
         throw syncError("NETWORK_ERROR", "无法连接 GitHub，请检查网络后重试。");
       }
     }
 
+    #finishResponse(response) {
+      this.#responseContexts.get(response)?.release();
+      this.#responseContexts.delete(response);
+    }
+
     async #json(response) {
+      const context = this.#responseContexts.get(response);
       try {
         return await response.json();
       } catch {
+        if (context?.controller.signal.aborted) {
+          throw syncError("NETWORK_ERROR", "GitHub 请求超时或已取消，请重试。");
+        }
         throw syncError("INVALID_RESPONSE", "GitHub 返回的数据无法读取。");
+      } finally {
+        this.#finishResponse(response);
       }
     }
 
@@ -261,6 +324,7 @@
       // Deployment creates data/notes.json first. A 404 now means missing
       // Contents access or a broken deployment, so it must not pass validation.
       if (!response.ok) throw httpError(response, "content");
+      this.#finishResponse(response);
       return true;
     }
 
@@ -337,6 +401,58 @@
         throw syncError("INVALID_RESPONSE", "GitHub 未返回新版本号，请重新加载笔记。");
       }
       return result.content.sha;
+    }
+
+    #assetUrl(asset) {
+      return `${this.#repoUrl}/contents/${asset.path.split("/").map(encodeURIComponent).join("/")}`;
+    }
+
+    async uploadAsset(asset, value) {
+      const token = this.#requireUnlocked();
+      const metadata = requireAsset(asset);
+      const bytes = requireImageBytes(value, metadata.mime);
+      await this.#assertPrivateRepo(token);
+      const response = await this.#fetch(this.#assetUrl(metadata), token, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "Add private notebook image", content: bytesToBase64(bytes) })
+      });
+      if (!response.ok) {
+        // Images are immutable. A retry after a completed upload is safe only
+        // when the existing private file has exactly the same bytes.
+        if (response.status === 409 || response.status === 422) {
+          let existing;
+          try { existing = await this.loadAsset(metadata); }
+          catch (error) {
+            if (error.code === "NOT_FOUND") throw httpError(response, "content");
+            throw error;
+          }
+          if (existing.length === bytes.length && existing.every((byte, index) => byte === bytes[index])) return metadata;
+          throw syncError("ASSET_EXISTS", "同一图片路径已存在不同文件，请重新插入该图片。");
+        }
+        throw httpError(response, "content");
+      }
+      const result = await this.#json(response);
+      if (typeof result.content?.sha !== "string") {
+        throw syncError("INVALID_RESPONSE", "GitHub 未确认图片保存结果，请重试。");
+      }
+      return metadata;
+    }
+
+    async loadAsset(asset) {
+      const token = this.#requireUnlocked();
+      const metadata = requireAsset(asset);
+      await this.#assertPrivateRepo(token);
+      const response = await this.#fetch(this.#assetUrl(metadata), token);
+      if (!response.ok) throw httpError(response, "content");
+      const file = await this.#json(response);
+      if (file.encoding === "none" || typeof file.size === "number" && file.size > MAX_CONTENT_BYTES) {
+        throw syncError("TOO_LARGE", "图片超过 1 MB，无法读取，请缩小图片后重新插入。");
+      }
+      if (file.encoding !== "base64" || typeof file.content !== "string" || file.content.length > 1_400_000) {
+        throw syncError("INVALID_DATA", "私有图片文件格式不受支持。");
+      }
+      return requireImageBytes(base64ToBytes(file.content), metadata.mime);
     }
 
     async saveDraft(value) {

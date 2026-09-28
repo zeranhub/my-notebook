@@ -8,6 +8,7 @@
   const ui = {
     pageTabs: $("pageTabs"), addPageButton: $("addPageButton"), renamePageButton: $("renamePageButton"),
     newNoteButton: $("newNoteButton"), canvasViewport: $("canvasViewport"), canvas: $("canvas"),
+    addImageButton: $("addImageButton"), insertImageButton: $("insertImageButton"), imageFile: $("imageFile"), zoomSelect: $("zoomSelect"),
     overflowBadge: $("overflowBadge"), overflowArea: $("overflowArea"), viewCapacityLabel: $("viewCapacityLabel"),
     viewMode: $("viewMode"), editMode: $("editMode"), backButton: $("backButton"),
     editorContent: $("editorContent"), editorStatus: $("editorStatus"),
@@ -26,12 +27,13 @@
   });
   const Layout = window.OnePageLayout;
   const Model = window.OnePageModel;
-  const empty = () => ({ version: 2, pages: [], notes: [], activePageId: null });
+  const empty = () => ({ version: 2, pages: [], notes: [], assets: {}, activePageId: null });
   const clone = value => JSON.parse(JSON.stringify(value));
   const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   // Parsing an old file can assign fresh migration timestamps. A page becomes
   // dirty only when its user-visible data or geometry changes.
   const signature = value => JSON.stringify({
+    assets: value.assets || {},
     pages: value.pages.map(p => [p.id, p.name, p.width, p.height, p.conflictOf || null]),
     notes: value.notes.map(n => [n.id, n.pageId, n.content, n.x, n.y, n.w, n.h,
       n.manualSize, n.manualPosition, n.conflictOf || null, n.legacyTags || null])
@@ -65,12 +67,20 @@
   let cloudQueue = Promise.resolve();
   let lastLayout = { placed: [], overflow: [], percent: 0 };
   let suppressClickUntil = 0;
+  let imageTarget = null;
+  let pendingImageTarget = null;
+  let imageBusy = false;
+  let zoom = "fit";
+  const assetUrls = new Map();
+  const assetLoads = new Map();
+  const measurementCache = new Map();
 
   function canonical(parsed) {
     return {
       version: 2,
       pages: clone(parsed.pages),
       notes: clone(parsed.notes),
+      assets: clone(parsed.assets || {}),
       activePageId: parsed.activePageId || parsed.pages[0]?.id || null
     };
   }
@@ -118,7 +128,10 @@
       UNSUPPORTED: "此浏览器不支持所需加密功能。",
       UNLOCK_FAILED: "PIN 错误，或本机授权信息已损坏。",
       INVALID_PIN: "请输入恰好 6 位数字 PIN。",
-      INVALID_TOKEN: "请输入 GitHub 访问令牌。"
+      INVALID_TOKEN: "请输入 GitHub 访问令牌。",
+      ASSET_CONFLICT: "图片文件与当前备份不一致，请重新选择图片。",
+      ASSET_EXISTS: "图片路径已存在不同文件，请重新选择图片。",
+      INVALID_ASSET: "图片信息有误，请重新选择图片。"
     };
     return messages[error?.code] || "操作失败，请稍后重试。";
   }
@@ -130,8 +143,166 @@
     toastTimer = setTimeout(() => ui.toast.classList.remove("is-visible"), 4600);
   }
 
-  // Measure the very same card style used on the paper. Text is assigned through
-  // textContent, so pasted HTML and Markdown remain ordinary, literal text.
+  function renderBody(element, source) {
+    window.OnePageMarkdown.render(element, source, {
+      assets: state.assets || {},
+      getAssetUrl: id => assetUrls.get(id) || null
+    });
+  }
+
+  function clearAssetUrls() {
+    for (const url of assetUrls.values()) URL.revokeObjectURL(url);
+    assetUrls.clear();
+    assetLoads.clear();
+    window.OnePageMarkdown.clearCache();
+    measurementCache.clear();
+  }
+
+  function uploadPrivateAsset(asset, bytes) {
+    const epoch = session;
+    const task = cloudQueue.catch(() => {}).then(() => {
+      if (!isCurrent(epoch)) throw new Error("页面已锁定，请重新插入图片。");
+      return transport.uploadAsset(asset, bytes);
+    });
+    cloudQueue = task.catch(() => {});
+    return task;
+  }
+
+  async function prepareImage(file) {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      throw new Error("请选择 PNG、JPG 或 WebP 图片。");
+    }
+    if (file.size > 20 * 1024 * 1024) throw new Error("图片超过 20 MB，请选择较小的图片。");
+    const bitmap = await createImageBitmap(file);
+    try {
+      if (bitmap.width * bitmap.height > 40_000_000) throw new Error("图片分辨率过大，请先缩小图片。");
+      const ratio = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
+      let width = Math.max(1, Math.round(bitmap.width * ratio));
+      let height = Math.max(1, Math.round(bitmap.height * ratio));
+      if (ratio === 1 && file.size <= 900000) {
+        return { bytes: new Uint8Array(await file.arrayBuffer()), mime: file.type, width, height };
+      }
+      const canvas = document.createElement("canvas");
+      for (let attempt = 0; attempt < 6; attempt++) {
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(bitmap, 0, 0, width, height);
+        const blob = await new Promise(resolve => canvas.toBlob(resolve,
+          attempt === 0 && file.type === "image/png" ? "image/png" : "image/webp", 0.9));
+        if (blob && blob.size <= 900000) return {
+          bytes: new Uint8Array(await blob.arrayBuffer()), mime: blob.type, width, height
+        };
+        width = Math.max(1, Math.round(width * 0.8));
+        height = Math.max(1, Math.round(height * 0.8));
+      }
+      throw new Error("图片暂时无法保存，请尝试较小的图片。");
+    } finally { bitmap.close(); }
+  }
+
+  function chooseImage(independent) {
+    if (!unlocked || imageBusy || (!remoteReady && !state.pages.length)) return;
+    const note = independent ? null : byId(editingId);
+    if (!independent && !note) return;
+    imageTarget = {
+      independent, pageId: currentPage()?.id, noteId: note?.id,
+      start: ui.editorContent.selectionStart, end: ui.editorContent.selectionEnd,
+      content: note?.content
+    };
+    ui.imageFile.click();
+  }
+
+  async function insertImage(file, target) {
+    if (!unlocked || imageBusy || !target) return;
+    if (Object.keys(state.assets || {}).length >= 3000 || (target.independent && state.notes.length >= 1000)) {
+      toast("已达到图片或笔记数量上限，请先导出备份。" );
+      return;
+    }
+    const epoch = session;
+    imageBusy = true;
+    pendingImageTarget = target;
+    ui.addImageButton.disabled = ui.insertImageButton.disabled = true;
+    setStatus("pending", "正在保存图片…");
+    try {
+      const prepared = await prepareImage(file);
+      if (!isCurrent(epoch)) return;
+      const id = `img-${crypto.randomUUID().replace(/-/g, "")}`;
+      const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[prepared.mime];
+      const asset = { id, path: `assets/${id}.${extension}`, mime: prepared.mime,
+        width: prepared.width, height: prepared.height, name: file.name.slice(0, 100) };
+      // Pictures are separate private files, so they do not consume the text file's size limit.
+      await uploadPrivateAsset(asset, prepared.bytes);
+      if (!isCurrent(epoch)) return;
+      const alt = file.name.replace(/[\[\]\\\r\n]/g, " ").slice(0, 80) || "图片";
+      const markup = `![${alt}](onepage:${id})`;
+      let note;
+      if (target.independent) {
+        if (state.notes.length >= 1000) throw new Error("笔记数量达到上限，图片尚未插入。");
+        const page = pageById(target.pageId) || currentPage();
+        if (!page) throw new Error("当前纸张不存在，请重试。");
+        note = Model.createNote(page.id);
+        note.content = markup;
+        if (Number.isFinite(target.x) && Number.isFinite(target.y)) {
+          note.x = target.x; note.y = target.y; note.manualPosition = true;
+        }
+        state.notes.push(note);
+      } else {
+        note = byId(target.noteId);
+        if (!note) throw new Error("原笔记已删除，图片尚未插入。");
+        const changedWhileUploading = note.content !== target.content;
+        const currentEditor = mode === "edit" && editingId === note.id;
+        const wantedStart = changedWhileUploading
+          ? (currentEditor ? ui.editorContent.selectionStart : note.content.length) : target.start;
+        const wantedEnd = changedWhileUploading ? wantedStart : target.end;
+        const start = Math.min(wantedStart, note.content.length);
+        const end = Math.max(start, Math.min(wantedEnd, note.content.length));
+        const insertion = `\n\n${markup}\n\n`;
+        if (note.content.length - (end - start) + insertion.length > 2_000_000) {
+          throw new Error("这篇笔记已达到长度上限，请将图片插入独立框。");
+        }
+        note.content = note.content.slice(0, start) + insertion + note.content.slice(end);
+        note.updatedAt = now();
+      }
+      state.assets[id] = asset;
+      assetUrls.set(id, URL.createObjectURL(new Blob([prepared.bytes], { type: prepared.mime })));
+      changed();
+      render();
+      if (!target.independent && mode === "edit" && editingId === note.id) ui.editorContent.focus();
+      toast("图片已插入，随笔记同步到私有仓库。" );
+    } catch (error) {
+      if (isCurrent(epoch)) {
+        setStatus("error", "图片未插入");
+        toast(error.code ? errorText(error) : error.message || "图片保存失败，请重试。" );
+      }
+    } finally {
+      if (isCurrent(epoch)) {
+        imageBusy = false;
+        pendingImageTarget = null;
+        ui.addImageButton.disabled = ui.insertImageButton.disabled = false;
+      }
+    }
+  }
+
+  function ensurePageImages(pageId) {
+    const ids = new Set();
+    for (const note of state.notes.filter(item => item.pageId === pageId)) {
+      for (const match of note.content.matchAll(/\(onepage:([A-Za-z0-9_-]+)\)/g)) ids.add(match[1]);
+    }
+    const epoch = session;
+    for (const id of ids) {
+      const asset = state.assets?.[id];
+      if (!asset || assetUrls.has(id) || assetLoads.has(id)) continue;
+      const task = transport.loadAsset(asset).then(bytes => {
+        if (!isCurrent(epoch)) return;
+        assetUrls.set(id, URL.createObjectURL(new Blob([bytes], { type: asset.mime })));
+        if (mode === "view" && currentPage()?.id === pageId) renderView();
+      }).catch(error => {
+        if (isCurrent(epoch)) toast(`图片暂时未加载：${errorText(error)}`);
+      });
+      // Keep a failed read in this session's map to avoid an automatic retry loop.
+      assetLoads.set(id, task);
+    }
+  }
+
+  // The measuring card uses exactly the same sanitized Markdown as the paper.
   const measurement = document.createElement("article");
   measurement.className = "note-card measurement-card";
   const measurementContent = document.createElement("div");
@@ -147,23 +318,60 @@
   document.body.append(measurement);
 
   function measureHeight(width, text) {
+    const roundedWidth = Math.ceil(width);
+    let heights = measurementCache.get(text);
+    if (heights?.has(roundedWidth)) return heights.get(roundedWidth);
     measurement.style.width = `${Math.ceil(width)}px`;
     measurement.style.height = "auto";
-    measurementContent.textContent = text || " ";
+    renderBody(measurementContent, text || " ");
     const height = Math.ceil(Math.max(measurement.scrollHeight, measurement.getBoundingClientRect().height));
-    measurementContent.textContent = "";
+    measurementContent.replaceChildren();
+    if (!heights) {
+      if (measurementCache.size >= 64) measurementCache.delete(measurementCache.keys().next().value);
+      heights = new Map();
+      measurementCache.set(text, heights);
+    }
+    heights.set(roundedWidth, height);
     return height;
+  }
+
+  function fitAlternative(note, page, placed, preferred) {
+    const maxWidth = page.width - Layout.MARGIN * 2;
+    const maxHeight = page.height - Layout.MARGIN * 2;
+    const widths = new Set([112, maxWidth]);
+    for (let width = 120; width < maxWidth; width += 24) widths.add(width);
+    for (let columns = 2; columns <= 6; columns++) {
+      widths.add(Math.floor((maxWidth - (columns - 1) * Layout.GAP) / columns));
+    }
+    let best = null;
+    for (const w of widths) {
+      const h = Math.ceil(Math.max(20, measureHeight(w, note.content) + 1));
+      if (h > maxHeight) continue;
+      const position = Layout.findPlacement(placed, { w, h }, page, preferred);
+      if (!position) continue;
+      const score = w * h * (1 + 0.1 * Math.abs(Math.log(w / h / 1.25)));
+      if (!best || score < best.score) best = { size: { w, h }, position, score };
+    }
+    return best;
   }
 
   function desiredSize(note, page) {
     const bounds = { w: page.width, h: page.height };
+    const margin = Layout.MARGIN;
     if (note.manualSize && Number.isFinite(note.w) && Number.isFinite(note.h)) {
-      const w = Math.max(240, Math.min(page.width - 32, Math.ceil(note.w)));
-      const h = Math.max(88, Math.ceil(note.h), measureHeight(w, note.content) + 2);
-      return h <= page.height - 32 ? { w, h } : null;
+      const w = Math.max(96, Math.min(page.width - margin * 2, Math.ceil(note.w)));
+      const h = Math.max(18, Math.ceil(note.h), measureHeight(w, note.content) + 1);
+      return h <= page.height - margin * 2 ? { w, h } : null;
+    }
+    const picture = /^\s*!\[[^\]]*\]\(onepage:([A-Za-z0-9_-]+)\)\s*$/.exec(note.content);
+    if (picture && state.assets[picture[1]]) {
+      const w = Math.min(180, page.width - margin * 2);
+      const h = Math.ceil(measureHeight(w, note.content) + 1);
+      return h <= page.height - margin * 2 ? { w, h } : null;
     }
     return Layout.makeRectSize(note.content, measureHeight, bounds, {
-      minWidth: 240, minHeight: 88, maxWidth: page.width - 32,
+      minWidth: 112, minHeight: 20, maxWidth: page.width - margin * 2,
+      extraHeight: 1,
       preferredWidth: Number.isFinite(note.w) ? note.w : undefined
     });
   }
@@ -179,16 +387,20 @@
     const placed = [];
     const overflow = [];
     for (const note of ordered) {
-      const size = desiredSize(note, page);
+      let size = desiredSize(note, page);
       if (!size) { overflow.push(note); continue; }
       const preferred = note.manualPosition && Number.isFinite(note.x) && Number.isFinite(note.y)
         ? { x: note.x, y: note.y } : null;
-      const position = Layout.findPlacement(placed, size, { w: page.width, h: page.height }, preferred);
+      let position = Layout.findPlacement(placed, size, { w: page.width, h: page.height }, preferred);
+      if (!position && !note.manualSize) {
+        const alternative = fitAlternative(note, page, placed, preferred);
+        if (alternative) { size = alternative.size; position = alternative.position; }
+      }
       if (!position) { overflow.push(note); continue; }
       const rect = { id: note.id, x: position.x, y: position.y, w: size.w, h: size.h };
       placed.push(rect);
     }
-    const usable = Math.max(1, (page.width - 32) * (page.height - 32));
+    const usable = Math.max(1, (page.width - Layout.MARGIN * 2) * (page.height - Layout.MARGIN * 2));
     const percent = Math.min(100, Math.round(100 * placed.reduce((sum, r) => sum + r.w * r.h, 0) / usable));
     return { placed, overflow, percent };
   }
@@ -198,7 +410,10 @@
     if (!page || !unlocked) return;
     const roomWidth = Math.max(220, ui.viewMode.clientWidth - 32);
     const roomHeight = Math.max(360, window.innerHeight - ui.viewMode.getBoundingClientRect().top - 45);
-    currentScale = Math.max(0.2, Math.min(1, roomWidth / page.width, roomHeight / page.height));
+    currentScale = zoom === "fit"
+      ? Math.max(0.2, Math.min(1, roomWidth / page.width, roomHeight / page.height))
+      : Number(zoom);
+    ui.viewMode.classList.toggle("is-zoomed", zoom !== "fit");
     ui.canvasViewport.style.setProperty("--page-scale", String(currentScale));
     ui.canvasViewport.style.setProperty("--scaled-page-width", `${Math.round(page.width * currentScale)}px`);
     ui.canvasViewport.style.setProperty("--scaled-page-height", `${Math.round(page.height * currentScale)}px`);
@@ -233,7 +448,7 @@
     }
     const content = document.createElement("div");
     content.className = "note-card-content";
-    content.textContent = note.content;
+    renderBody(content, note.content);
     card.append(content);
     if (!overflow) {
       const resize = document.createElement("button");
@@ -304,6 +519,7 @@
     }
     updatePaperScale();
     renderTabs();
+    ensurePageImages(page.id);
   }
 
   function renderEdit() {
@@ -380,24 +596,42 @@
     const existing = lastLayout.placed.filter(rect => rect.id !== note.id);
     let candidate = { ...start };
     let moved = false;
+    card.classList.add("is-moving");
+    const margin = Layout.MARGIN;
+    const edge = (value, min, max) => {
+      const bounded = Math.max(min, Math.min(max, value));
+      if (bounded - min <= 8) return min;
+      if (max - bounded <= 8) return max;
+      return Math.round(bounded * 2) / 2;
+    };
     const onMove = move => {
       if (move.pointerId !== event.pointerId) return;
       const dx = (move.clientX - origin.x) / currentScale;
       const dy = (move.clientY - origin.y) / currentScale;
       if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
-      const snap = value => Math.round(value / 4) * 4;
-      const next = kind === "drag"
-        ? { ...start, x: snap(start.x + dx), y: snap(start.y + dy) }
-        : { ...start, w: snap(Math.max(240, start.w + dx)), h: snap(Math.max(88, start.h + dy)) };
-      if (kind === "resize" && next.h < measureHeight(next.w, note.content) + 2) {
-        card.classList.add("is-invalid");
-        return;
+      let next;
+      if (kind === "drag") next = {
+        ...start,
+        x: edge(start.x + dx, margin, page.width - margin - start.w),
+        y: edge(start.y + dy, margin, page.height - margin - start.h)
+      };
+      else {
+        const w = edge(start.w + dx, 96, page.width - margin - start.x);
+        const minimumHeight = Math.max(18, measureHeight(w, note.content) + 1);
+        const maximumHeight = page.height - margin - start.y;
+        if (minimumHeight > maximumHeight) return;
+        next = { ...start, w, h: edge(start.h + dy, minimumHeight, maximumHeight) };
       }
       if (!Layout.isValidRect(next, existing, { w: page.width, h: page.height })) {
-        card.classList.add("is-invalid");
-        return;
+        if (kind === "drag") {
+          // Slide along an occupied rectangle, just as the paper edge clamps a drag.
+          const horizontal = { ...candidate, x: next.x };
+          const vertical = { ...candidate, y: next.y };
+          if (Layout.isValidRect(horizontal, existing, page)) next = horizontal;
+          else if (Layout.isValidRect(vertical, existing, page)) next = vertical;
+          else return;
+        } else return;
       }
-      card.classList.remove("is-invalid");
       candidate = next;
       card.style.left = `${next.x}px`;
       card.style.top = `${next.y}px`;
@@ -409,7 +643,7 @@
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
-      card.classList.remove("is-invalid");
+      card.classList.remove("is-moving");
       if (moved) suppressClickUntil = Date.now() + 350;
       if (!equal(candidate, start)) {
         note.x = candidate.x; note.y = candidate.y;
@@ -473,6 +707,7 @@
 
   function changed() {
     if (!unlocked) return;
+    measurementCache.clear();
     changeNumber++;
     setStatus("pending", "正在保存加密草稿…");
     queueDraft();
@@ -501,6 +736,9 @@
     remoteReady = true;
     migrationPending = migrationPending || incoming.migrated;
     if (editingId && merged.replacements?.[editingId]) editingId = merged.replacements[editingId];
+    if (pendingImageTarget?.noteId && merged.replacements?.[pendingImageTarget.noteId]) {
+      pendingImageTarget.noteId = merged.replacements[pendingImageTarget.noteId];
+    }
     ensurePage();
     setDocumentReady(true);
     render();
@@ -595,14 +833,15 @@
     document.querySelector(".main-content").inert = !allow;
     for (const item of [ui.addPageButton, ui.renamePageButton, ui.newNoteButton,
       ui.syncButton, ui.lockButton, ui.importButton, ui.exportButton,
-      ui.backButton, ui.editorContent, ui.moveToNewPageButton, ui.deleteButton]) {
+      ui.backButton, ui.editorContent, ui.moveToNewPageButton, ui.deleteButton,
+      ui.addImageButton, ui.insertImageButton, ui.zoomSelect]) {
       item.disabled = !allow;
     }
   }
 
   function setDocumentReady(ready) {
     for (const item of [ui.addPageButton, ui.renamePageButton, ui.newNoteButton,
-      ui.importButton, ui.exportButton]) item.disabled = !ready;
+      ui.importButton, ui.exportButton, ui.addImageButton]) item.disabled = !ready;
   }
 
   function showAccess(which) {
@@ -628,11 +867,15 @@
     }
     session++;
     unlocked = false;
+    imageBusy = false;
+    imageTarget = null;
+    pendingImageTarget = null;
     remoteReady = false;
     setDocumentReady(false);
     for (const timer of [syncTimer, retryTimer, pollTimer, layoutTimer]) clearTimeout(timer);
     syncTimer = retryTimer = pollTimer = layoutTimer = null;
     transport.lock();
+    clearAssetUrls();
     state = empty(); baseline = empty(); sha = null;
     viewPageId = editingId = null;
     lastLayout = { placed: [], overflow: [], percent: 0 };
@@ -671,6 +914,8 @@
       throw new Error("LIMIT_EXCEEDED");
     }
     const pageMap = new Map();
+    validateImportedAssets(source.assets || {});
+    state.assets = { ...(state.assets || {}), ...(source.assets || {}) };
     for (const oldPage of source.pages) {
       if (useExistingPage) pageMap.set(oldPage.id, state.pages[0].id);
       else {
@@ -739,6 +984,7 @@
     const epoch = session;
     unlocked = true;
     remoteReady = false;
+    clearAssetUrls();
     setDocumentReady(false);
     draftFailed = false;
     state = empty(); baseline = empty(); sha = null;
@@ -829,7 +1075,46 @@
   });
 
   ui.lockButton.addEventListener("click", lock);
-  ui.syncButton.addEventListener("click", () => requestSync(true));
+  ui.syncButton.addEventListener("click", () => {
+    for (const id of assetLoads.keys()) if (!assetUrls.has(id)) assetLoads.delete(id);
+    if (mode === "view") ensurePageImages(currentPage()?.id);
+    requestSync(true);
+  });
+  ui.zoomSelect.addEventListener("change", () => {
+    zoom = ui.zoomSelect.value;
+    if (unlocked && mode === "view") updatePaperScale();
+  });
+  ui.addImageButton.addEventListener("click", () => chooseImage(true));
+  ui.insertImageButton.addEventListener("click", () => chooseImage(false));
+  ui.imageFile.addEventListener("change", () => {
+    const file = ui.imageFile.files[0];
+    ui.imageFile.value = "";
+    if (file) insertImage(file, imageTarget);
+    imageTarget = null;
+  });
+  ui.editorContent.addEventListener("paste", event => {
+    const file = [...(event.clipboardData?.files || [])].find(item => item.type.startsWith("image/"));
+    if (!file || !unlocked || imageBusy) return;
+    event.preventDefault();
+    insertImage(file, { independent: false, noteId: editingId,
+      start: ui.editorContent.selectionStart, end: ui.editorContent.selectionEnd,
+      content: byId(editingId)?.content });
+  });
+  ui.canvas.addEventListener("dragover", event => {
+    if (unlocked && [...(event.dataTransfer?.items || [])].some(item => item.kind === "file")) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    }
+  });
+  ui.canvas.addEventListener("drop", event => {
+    const file = [...(event.dataTransfer?.files || [])].find(item => item.type.startsWith("image/"));
+    if (!file || !unlocked || imageBusy) return;
+    event.preventDefault();
+    const box = ui.canvas.getBoundingClientRect();
+    insertImage(file, { independent: true, pageId: currentPage()?.id,
+      x: Math.max(Layout.MARGIN, (event.clientX - box.left) / currentScale),
+      y: Math.max(Layout.MARGIN, (event.clientY - box.top) / currentScale) });
+  });
   ui.pageTabs.setAttribute("role", "tablist");
   ui.addPageButton.addEventListener("click", () => {
     if (!unlocked || (!remoteReady && !state.pages.length)) return;
@@ -905,18 +1190,55 @@
     toast("笔记已删除。" );
   });
 
-  ui.exportButton.addEventListener("click", () => {
+  function bytesToBase64(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(binary);
+  }
+
+  function backupBytes(value) {
+    if (typeof value !== "string" || value.length > 1_400_000) throw new Error("INVALID_BACKUP_IMAGE");
+    const binary = atob(value);
+    return Uint8Array.from(binary, character => character.charCodeAt(0));
+  }
+
+  function validateImportedAssets(assets) {
+    if (new Set([...Object.keys(state.assets || {}), ...Object.keys(assets)]).size > 3000) {
+      throw new Error("LIMIT_EXCEEDED");
+    }
+    for (const [id, asset] of Object.entries(assets)) {
+      if (state.assets?.[id] && !equal(state.assets[id], asset)) {
+        const error = new Error("备份中的图片信息与现有图片不一致，请使用原始备份。");
+        error.code = "ASSET_CONFLICT";
+        throw error;
+      }
+    }
+  }
+
+  ui.exportButton.addEventListener("click", async () => {
     if (!unlocked) return;
-    const payload = JSON.stringify({ ...state, exportedAt: now() }, null, 2);
-    const url = URL.createObjectURL(new Blob([payload], { type: "application/json;charset=utf-8" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `一页纸备份-${now().slice(0, 10)}.json`;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast("备份已导出，请妥善保存文件。" );
+    const epoch = session;
+    const snapshot = clone(state);
+    ui.exportButton.disabled = true;
+    try {
+      const assetFiles = {};
+      for (const asset of Object.values(snapshot.assets || {})) {
+        const bytes = await transport.loadAsset(asset);
+        if (!isCurrent(epoch)) return;
+        assetFiles[asset.id] = bytesToBase64(bytes);
+      }
+      const payload = JSON.stringify({ ...snapshot, assetFiles, exportedAt: now() }, null, 2);
+      const url = URL.createObjectURL(new Blob([payload], { type: "application/json;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `一页纸备份-${now().slice(0, 10)}.json`;
+      document.body.append(link);
+      link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("正文和图片已一起导出，请妥善保存。" );
+    } catch (error) {
+      if (isCurrent(epoch)) toast(`备份未完成：${errorText(error)}`);
+    } finally { if (isCurrent(epoch)) ui.exportButton.disabled = false; }
   });
   ui.importButton.addEventListener("click", () => { if (unlocked) ui.importFile.click(); });
   ui.importFile.addEventListener("change", async () => {
@@ -924,18 +1246,35 @@
     const file = ui.importFile.files[0];
     ui.importFile.value = "";
     if (!file || !isCurrent(epoch) || (!remoteReady && !state.pages.length)) return;
-    if (file.size > 5 * 1024 * 1024) { toast("文件超过 5 MB，请选择较小的备份。" ); return; }
+    if (file.size > 50 * 1024 * 1024) { toast("文件超过 50 MB，请选择较小的备份。" ); return; }
+    if (imageBusy) { toast("图片正在保存，请稍后导入。" ); return; }
+    imageBusy = true;
+    ui.importButton.disabled = true;
     try {
       const raw = JSON.parse(await file.text());
       if (!isCurrent(epoch)) return;
       const parsed = parseData(raw);
+      validateImportedAssets(parsed.data.assets || {});
+      if (state.pages.length + parsed.data.pages.length > 100 || state.notes.length + parsed.data.notes.length > 1000) {
+        throw new Error("LIMIT_EXCEEDED");
+      }
+      for (const asset of Object.values(parsed.data.assets || {})) {
+        if (raw.assetFiles?.[asset.id]) await uploadPrivateAsset(asset, backupBytes(raw.assetFiles[asset.id]));
+        else await transport.loadAsset(asset);
+        if (!isCurrent(epoch)) return;
+      }
       const count = appendImported(parsed.data);
       changed();
       render();
       toast(`已导入 ${count} 篇笔记，原有内容仍保留。`);
     } catch (error) {
       if (isCurrent(epoch)) toast(error?.message === "LIMIT_EXCEEDED"
-        ? "导入后会超过页面或笔记数量上限。" : "导入失败：请选择本笔记本的 JSON 备份。" );
+        ? "导入后会超过页面或笔记数量上限。" : "导入失败：备份格式或图片文件不完整，原有笔记已保留。" );
+    } finally {
+      if (isCurrent(epoch)) {
+        imageBusy = false;
+        ui.importButton.disabled = false;
+      }
     }
   });
 
@@ -946,7 +1285,7 @@
   });
   window.addEventListener("resize", () => { if (unlocked && mode === "view") updatePaperScale(); });
   window.addEventListener("beforeunload", event => {
-    if (unlocked && (draftPending > 0 || draftFailed)) {
+    if (unlocked && (draftPending > 0 || draftFailed || imageBusy)) {
       event.preventDefault();
       event.returnValue = "";
     }

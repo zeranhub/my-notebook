@@ -1,5 +1,5 @@
-/* One-page notebook data model. All content is stored as text; the view must
- * render user text with textContent or an equally safe text renderer. */
+/* One-page notebook data model. Note bodies are Markdown text; image files
+ * remain in the private repository and this document contains metadata only. */
 (() => {
   "use strict";
 
@@ -7,12 +7,14 @@
   const DEFAULT_HEIGHT = 1123;
   const MAX_PAGES = 100;
   const MAX_NOTES = 1000;
+  const MAX_ASSETS = 3000;
   // Keep local drafts readable even when they exceed GitHub's smaller 1 MB
   // upload limit. The editor uses the same bound, so it cannot save a draft
   // that this model will reject on the next unlock.
   const MAX_CONTENT_LENGTH = 2_000_000;
   const MAX_COORDINATE = 100_000;
   const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/;
+  const IMAGE_EXTENSIONS = Object.freeze({ "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" });
 
   function modelError(code, message) {
     const error = new Error(message);
@@ -79,6 +81,44 @@
       if (clean && !tags.includes(clean)) tags.push(clean);
     }
     return tags.length ? tags : undefined;
+  }
+
+  function normalizeAssets(raw) {
+    if (raw === undefined) return {};
+    if (!isRecord(raw)) fail("INVALID_DATA", "图片目录格式有误。");
+    const entries = Object.entries(raw);
+    if (entries.length > MAX_ASSETS) fail("LIMIT_EXCEEDED", "图片数量超过上限。");
+    const assets = {};
+    for (const [id, item] of entries) {
+      if (!validId(id) || ["constructor", "prototype", "__proto__"].includes(id) ||
+          !isRecord(item) || item.id !== id) {
+        fail("INVALID_ASSET", "图片标识有误。");
+      }
+      const extension = Object.hasOwn(IMAGE_EXTENSIONS, item.mime) ? IMAGE_EXTENSIONS[item.mime] : null;
+      if (!extension || item.path !== `assets/${id}.${extension}`) {
+        fail("INVALID_ASSET", "图片格式或私有仓库路径有误。");
+      }
+      if (![item.width, item.height].every(value => Number.isInteger(value) && value >= 1 && value <= 30_000)) {
+        fail("INVALID_ASSET", "图片尺寸有误。");
+      }
+      assets[id] = { id, path: item.path, mime: item.mime, width: item.width, height: item.height,
+        name: item.name === undefined ? id : text(item.name, "图片名称", 255) };
+    }
+    return assets;
+  }
+
+  function mergeAssets(...dictionaries) {
+    const assets = {};
+    for (const dictionary of dictionaries) {
+      for (const [id, asset] of Object.entries(dictionary)) {
+        if (Object.hasOwn(assets, id) && JSON.stringify(assets[id]) !== JSON.stringify(asset)) {
+          fail("ASSET_CONFLICT", "同一图片标识对应了不同文件，请重新插入该图片。");
+        }
+        assets[id] = clone(asset);
+      }
+    }
+    if (Object.keys(assets).length > MAX_ASSETS) fail("LIMIT_EXCEEDED", "合并后的图片数量超过上限。");
+    return assets;
   }
 
   function normalizePage(raw, index) {
@@ -160,7 +200,7 @@
       if (tags) note.legacyTags = tags;
       return note;
     });
-    return { version: 2, pages: [page], notes, activePageId: page.id, migrated: true };
+    return { version: 2, pages: [page], notes, assets: {}, activePageId: page.id, migrated: true };
   }
 
   function parse(raw) {
@@ -188,7 +228,7 @@
     const notes = value.notes.map((note, index) => normalizeNewNote(note, index, pageIds, pages[0].id));
     if (new Set(notes.map(note => note.id)).size !== notes.length) fail("INVALID_DATA", "笔记标识重复。");
     const activePageId = pageIds.has(value.activePageId) ? value.activePageId : pages[0].id;
-    return { version: 2, pages, notes, activePageId, migrated: false };
+    return { version: 2, pages, notes, assets: normalizeAssets(value.assets), activePageId, migrated: false };
   }
 
   function createPage(index, width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT) {
@@ -303,7 +343,7 @@
     const activePageId = pageIds.has(requestedActive) ? requestedActive
       : pageIds.has(remote.activePageId) ? remote.activePageId : pages[0].id;
     return {
-      data: { version: 2, pages, notes, activePageId },
+      data: { version: 2, pages, notes, assets: mergeAssets(base.assets, local.assets, remote.assets), activePageId },
       conflicts: pageResult.conflicts + noteResult.conflicts,
       replacements: noteResult.replacements
     };

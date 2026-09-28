@@ -2,8 +2,8 @@
 (function (root) {
   'use strict';
 
-  const MARGIN = 16;
-  const GAP = 12;
+  const MARGIN = 6;
+  const GAP = 4;
   const EPSILON = 0.000001;
 
   function number(value, fallback) {
@@ -133,16 +133,16 @@
     const availableHeight = paper.h - 2 * margin;
     if (availableWidth <= 0 || availableHeight <= 0) return null;
 
-    const minWidth = Math.min(availableWidth, Math.max(1, number(settings.minWidth, 184)));
+    const minWidth = Math.min(availableWidth, Math.max(1, number(settings.minWidth, 112)));
     const maxWidth = Math.min(availableWidth, Math.max(minWidth, number(settings.maxWidth, availableWidth)));
-    const minHeight = Math.max(1, number(settings.minHeight, 88));
+    const minHeight = Math.max(1, number(settings.minHeight, 20));
     const extraHeight = Math.max(0, number(settings.extraHeight, 2));
     const targetAspect = Math.max(0.1, number(settings.targetAspect, 1.25));
     if (minHeight > availableHeight) return null;
 
     const widths = [minWidth, maxWidth];
     // Dense enough to respond to line wraps while keeping measurement inexpensive.
-    for (let width = Math.ceil(minWidth / 32) * 32; width < maxWidth; width += 32) widths.push(width);
+    for (let width = Math.ceil(minWidth / 24) * 24; width < maxWidth; width += 24) widths.push(width);
     if (Number.isFinite(Number(settings.preferredWidth))) widths.push(Number(settings.preferredWidth));
 
     let best = null;

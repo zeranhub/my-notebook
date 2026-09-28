@@ -3,15 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f6f5f1">
+  <meta name="theme-color" content="#ffffff">
   <meta name="description" content="一页纸：在私人纸张上自由摆放笔记，并同步到你的私有 GitHub 仓库。">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://api.github.com; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.github.com; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
   <title>一页纸</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='10' y='5' width='44' height='54' rx='5' fill='%23ffffff' stroke='%232f4e40' stroke-width='4'/%3E%3Cpath d='M20 23h24M20 33h21M20 43h16' stroke='%232f4e40' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='10' y='5' width='44' height='54' rx='2' fill='%23ffffff' stroke='%23333333' stroke-width='3'/%3E%3Cpath d='M20 23h24M20 33h21M20 43h16' stroke='%23333333' stroke-width='2'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
   <script src="sync.js" defer></script>
   <script src="layout.js" defer></script>
   <script src="model.js" defer></script>
+  <script src="vendor/marked.umd.js" defer></script>
+  <script src="vendor/purify.min.js" defer></script>
+  <script src="markdown.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -26,6 +29,8 @@
         </nav>
         <div class="topbar-actions">
           <button id="newNoteButton" class="button button-primary" type="button">＋ 新建笔记</button>
+          <button id="addImageButton" class="button button-quiet" type="button" title="将图片作为独立内容放到纸张上">图片</button>
+          <label class="zoom-control"><span class="sr-only">纸张显示比例</span><select id="zoomSelect" aria-label="纸张显示比例"><option value="fit">整页</option><option value="1">100%</option><option value="1.5">150%</option><option value="2">200%</option></select></label>
           <div class="sync-status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">等待连接</span></div>
           <button id="syncButton" class="button button-quiet" type="button">同步</button>
           <button id="lockButton" class="button button-quiet" type="button">锁定</button>
@@ -34,6 +39,7 @@
             <button id="exportButton" class="button button-quiet" type="button">备份</button>
             <input id="importFile" type="file" accept=".json,application/json" hidden>
           </div>
+          <input id="imageFile" type="file" accept="image/png,image/jpeg,image/webp" hidden>
         </div>
       </div>
     </header>
@@ -56,10 +62,11 @@
         <div class="editor-panel">
           <div class="editor-toolbar">
             <button id="backButton" class="button button-back" type="button"><span aria-hidden="true">←</span> 返回纸张</button>
+            <button id="insertImageButton" class="button button-quiet" type="button" title="在当前正文位置插入图片">插入图片</button>
             <span id="editorStatus" class="editor-status" role="status" aria-live="polite"></span>
           </div>
           <label class="sr-only" for="editorContent">笔记正文</label>
-          <textarea id="editorContent" class="editor-content" placeholder="写下你的想法……" spellcheck="true" maxlength="2000000"></textarea>
+          <textarea id="editorContent" class="editor-content" placeholder="写下正文……支持 Markdown，可粘贴或插入图片。" spellcheck="true" maxlength="2000000"></textarea>
           <div class="editor-footer">
             <div class="editor-capacity">
               <span id="capacityLabel">这张纸还有空间</span>
