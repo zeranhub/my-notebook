@@ -39,7 +39,7 @@
     assets: value.assets || {},
     pages: value.pages.map(p => [p.id, p.name, p.width, p.height, p.conflictOf || null]),
     notes: value.notes.map(n => [n.id, n.pageId, n.content, n.x, n.y, n.w, n.h,
-      n.manualSize, n.manualPosition, n.contentScale ?? 1, n.conflictOf || null, n.legacyTags || null])
+      n.manualSize, n.manualPosition, n.contentScale ?? 1, n.layer ?? 0, n.conflictOf || null, n.legacyTags || null])
   });
   const now = () => new Date().toISOString();
   const byId = id => state.notes.find(note => note.id === id);
@@ -519,7 +519,8 @@
       if (!size) { overflow.push(note); continue; }
       const preferred = note.manualPosition && Number.isFinite(note.x) && Number.isFinite(note.y)
         ? { x: note.x, y: note.y } : null;
-      let position = Layout.findPlacement(placed, size, { w: page.width, h: page.height }, preferred);
+      let position = Layout.findPlacement(placed, size, { w: page.width, h: page.height }, preferred,
+        { allowOverlap: Boolean(preferred) });
       if (!position && !note.manualSize) {
         const alternative = fitAlternative(note, page, placed, preferred);
         if (alternative) { size = alternative.size; position = alternative.position; }
@@ -529,7 +530,7 @@
       placed.push(rect);
     }
     const usable = Math.max(1, (page.width - Layout.MARGIN * 2) * (page.height - Layout.MARGIN * 2));
-    const percent = Math.min(100, Math.round(100 * placed.reduce((sum, r) => sum + r.w * r.h, 0) / usable));
+    const percent = Math.min(100, Math.round(100 * Layout.coveredArea(placed) / usable));
     return { placed, overflow, percent };
   }
 
@@ -635,11 +636,42 @@
     const box = card.getBoundingClientRect();
     const viewport = ui.paperViewport.getBoundingClientRect();
     const widthY = box.top + box.height / 2;
-    const scaleY = Math.max(box.bottom, widthY + 34);
-    for (const [button, y] of [[ui.touchWidthHandle, widthY], [ui.touchScaleHandle, scaleY]]) {
-      button.hidden = box.right < viewport.left || box.right > viewport.right ||
-        y < Math.max(0, viewport.top) || y > Math.min(window.innerHeight, viewport.bottom);
-      button.style.left = `${Math.min(window.innerWidth - 23, Math.max(23, box.right))}px`;
+    // A screen-sized control must not cover the body of a dense note. Its old
+    // edge-centred 44px hit area could swallow an entire note at fit zoom.
+    const radius = 22, gap = 2;
+    const left = radius + 1, right = window.innerWidth - radius - 1;
+    const minY = Math.max(0, viewport.top) + radius + 1;
+    const maxY = Math.min(window.innerHeight, viewport.bottom) - radius - 1;
+    let x = box.right + radius + gap;
+    let widthTop = widthY;
+    let scaleTop = Math.max(box.bottom + radius + gap, widthY + 48);
+    let scaleX = x;
+    let besideBody = true;
+    if (x > right) {
+      x = box.left - radius - gap;
+      scaleX = x;
+      if (x < left) {
+        besideBody = false;
+        // A note can span the visible screen when zoomed. Put the controls
+        // outside its top or bottom instead of covering its text.
+        const above = box.top - radius - gap;
+        const below = box.bottom + radius + gap;
+        widthTop = scaleTop = above >= minY && above <= maxY ? above : below;
+        x = right;
+        scaleX = Math.max(left, x - 48);
+      }
+    }
+    if (besideBody) {
+      // Horizontal separation already protects every body point. Keep both
+      // full touch targets visible for a tiny note at the top or bottom edge.
+      widthTop = Math.max(minY, Math.min(maxY - 48, widthTop));
+      scaleTop = Math.max(widthTop + 48, Math.min(maxY, scaleTop));
+    }
+    for (const [button, buttonX, y] of [[ui.touchWidthHandle, x, widthTop], [ui.touchScaleHandle, scaleX, scaleTop]]) {
+      button.hidden = box.right < viewport.left || box.left > viewport.right ||
+        box.bottom < viewport.top || box.top > viewport.bottom ||
+        y < minY || y > maxY;
+      button.style.left = `${buttonX}px`;
       button.style.top = `${y}px`;
     }
   }
@@ -755,6 +787,15 @@
     const content = document.createElement("div");
     content.className = "note-card-content";
     renderBody(content, note.content);
+    // Image placeholders contain labels too; only actual prose or other
+    // visible Markdown blocks make a card part of the upper text layer.
+    let imageOnly = Boolean(content.querySelector(".md-image")) &&
+      !content.querySelector("hr,input,table,pre,blockquote");
+    const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+    while (imageOnly && walker.nextNode()) {
+      if (walker.currentNode.textContent.trim() && !walker.currentNode.parentElement?.closest(".md-image")) imageOnly = false;
+    }
+    card.dataset.noteKind = imageOnly ? "image" : "text";
     if (rect) styleCardContent(content, rect);
     else {
       const size = contentSize(Math.min(782, ui.overflowArea.clientWidth || Math.max(80, window.innerWidth - 34)), note.content, noteScale(note));
@@ -799,6 +840,37 @@
     return card;
   }
 
+  function noteLayer(note) {
+    return Number.isSafeInteger(note?.layer) && note.layer >= 0 ? note.layer : 0;
+  }
+
+  function updateCardLayers(frontId = null) {
+    const cards = [...ui.canvas.children];
+    const index = new Map(cards.map((card, position) => [card, position]));
+    const notes = new Map(state.notes.map(note => [note.id, note]));
+    cards.sort((a, b) => {
+      const aText = a.dataset.noteKind !== "image", bText = b.dataset.noteKind !== "image";
+      if (aText !== bText) return Number(aText) - Number(bText);
+      const aFront = a.dataset.noteId === frontId, bFront = b.dataset.noteId === frontId;
+      return Number(aFront) - Number(bFront) ||
+        noteLayer(notes.get(a.dataset.noteId)) - noteLayer(notes.get(b.dataset.noteId)) || index.get(a) - index.get(b);
+    });
+    cards.forEach((card, position) => { card.style.zIndex = String(position + 1); });
+  }
+
+  function raiseNoteLayer(note) {
+    const peers = state.notes.filter(item => item.pageId === note.pageId);
+    let maximum = Math.max(0, ...peers.map(noteLayer));
+    // Stored order values never become CSS z-index values. Rebase only if a
+    // very old/imported counter has reached JavaScript's exact integer limit.
+    if (maximum >= Number.MAX_SAFE_INTEGER - 1) {
+      peers.sort((a, b) => noteLayer(a) - noteLayer(b));
+      peers.forEach((item, position) => { item.layer = position + 1; item.updatedAt = now(); });
+      maximum = peers.length;
+    }
+    note.layer = maximum + 1;
+  }
+
   function renderTabs() {
     ui.pageTabs.replaceChildren();
     for (const page of state.pages) {
@@ -827,6 +899,7 @@
       const rect = placedById.get(note.id);
       if (rect) ui.canvas.append(createCard(note, rect));
     }
+    updateCardLayers();
     if (result.overflow.length) {
       const heading = document.createElement("p");
       heading.className = "overflow-heading";
@@ -947,7 +1020,6 @@
     if (!placed) return;
     const start = { x: placed.x, y: placed.y, w: placed.w, h: placed.h };
     const origin = { x: event.clientX, y: event.clientY };
-    const existing = lastLayout.placed.filter(rect => rect.id !== note.id);
     const moveScale = currentScale;
     const initialScale = noteScale(note);
     let candidateScale = initialScale;
@@ -956,6 +1028,7 @@
     let candidate = { ...start };
     let moved = false;
     card.classList.add("is-moving");
+    updateCardLayers(note.id);
     const margin = Layout.MARGIN;
     const edge = (value, min, max) => {
       const bounded = Math.max(min, Math.min(max, value));
@@ -981,12 +1054,12 @@
           Math.min(page.width - margin - start.x, start.w + dx));
         const resized = value => contentSize(value, note.content, initialScale);
         let size = resized(targetWidth);
-        if (!Layout.isValidRect({ ...start, w: size.w, h: size.h }, existing, page)) {
+        if (!Layout.isWithinBounds({ ...start, w: size.w, h: size.h }, page)) {
           let valid = start.w, invalid = targetWidth;
           for (let attempt = 0; attempt < 12; attempt++) {
             const middle = (valid + invalid) / 2;
             const measured = resized(middle);
-            if (Layout.isValidRect({ ...start, w: measured.w, h: measured.h }, existing, page)) {
+            if (Layout.isWithinBounds({ ...start, w: measured.w, h: measured.h }, page)) {
               valid = middle; size = measured;
             } else invalid = middle;
           }
@@ -1004,12 +1077,12 @@
         let bounded = Math.max(0.25 / initialScale, Math.min(maximum, factor));
         const scaledRect = value => ({ ...start, w: 2 + innerWidth * value, h: 2 + innerHeight * value });
         next = scaledRect(bounded);
-        if (!Layout.isValidRect(next, existing, page)) {
-          // Find the largest valid enlargement before another note or the edge.
+        if (!Layout.isWithinBounds(next, page)) {
+          // Keep the largest valid enlargement within the finite paper.
           let low = 1, high = bounded;
           for (let attempt = 0; attempt < 18; attempt++) {
             const middle = (low + high) / 2;
-            if (Layout.isValidRect(scaledRect(middle), existing, page)) low = middle;
+            if (Layout.isWithinBounds(scaledRect(middle), page)) low = middle;
             else high = middle;
           }
           bounded = low;
@@ -1017,16 +1090,7 @@
         }
         candidateScale = Math.max(0.25, Math.min(8, initialScale * bounded));
       }
-      if (!Layout.isValidRect(next, existing, { w: page.width, h: page.height })) {
-        if (kind === "drag") {
-          // Slide along an occupied rectangle, just as the paper edge clamps a drag.
-          const horizontal = { ...candidate, x: next.x };
-          const vertical = { ...candidate, y: next.y };
-          if (Layout.isValidRect(horizontal, existing, page)) next = horizontal;
-          else if (Layout.isValidRect(vertical, existing, page)) next = vertical;
-          else return;
-        } else return;
-      }
+      if (!Layout.isWithinBounds(next, page)) return;
       candidate = next;
       card.style.left = `${next.x}px`;
       card.style.top = `${next.y}px`;
@@ -1051,9 +1115,10 @@
       if (moved || event.pointerType === "touch") suppressClickUntil = Date.now() + 500;
       // A background sync can replace the document while the pointer is held.
       const currentNote = byId(note.id);
-      if (up.type !== "pointercancel" && currentNote?.pageId === page.id && !equal(candidate, start)) {
+      if (up.type !== "pointercancel" && currentNote?.pageId === page.id) {
         currentNote.x = candidate.x; currentNote.y = candidate.y;
         currentNote.w = candidate.w; currentNote.h = candidate.h;
+        raiseNoteLayer(currentNote);
         if (kind === "drag") currentNote.manualPosition = true;
         else {
           currentNote.manualPosition = true; currentNote.manualSize = true;
@@ -1430,12 +1495,13 @@
       note.x = oldNote.x; note.y = oldNote.y;
       note.w = oldNote.w; note.h = oldNote.h;
       note.contentScale = oldNote.contentScale;
+      note.layer = oldNote.layer ?? 0;
       note.manualSize = oldNote.manualSize;
       note.manualPosition = oldNote.manualPosition;
       note.createdAt = oldNote.createdAt;
       note.updatedAt = oldNote.updatedAt;
       if (oldNote.legacyTags) note.legacyTags = [...oldNote.legacyTags];
-      // Invalid or colliding saved positions are repacked by layoutPage.
+      // Saved overlaps are retained; positions are still constrained to A4.
       state.notes.push(note);
       added++;
     }

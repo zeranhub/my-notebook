@@ -69,6 +69,10 @@
       ? value : 1;
   }
 
+  function layer(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  }
+
   function text(value, label, maxLength) {
     if (typeof value !== "string" || value.length > maxLength) {
       fail("INVALID_DATA", `${label}必须是长度不超过 ${maxLength} 的文字。`);
@@ -150,6 +154,7 @@
       pageId: pageIds.has(raw.pageId) ? raw.pageId : fallbackPageId,
       content: text(raw.content, "笔记正文", MAX_CONTENT_LENGTH),
       contentScale: contentScale(raw.contentScale),
+      layer: layer(raw.layer),
       x: position(raw.x),
       y: position(raw.y),
       w: size(raw.w),
@@ -197,7 +202,7 @@
       const now = timestamp();
       const note = {
         id, pageId: page.id, content,
-        contentScale: 1,
+        contentScale: 1, layer: 0,
         x: null, y: null, w: null, h: null,
         manualSize: false, manualPosition: false,
         createdAt: dateOrNow(raw.createdAt, now),
@@ -260,7 +265,7 @@
     const now = timestamp();
     return {
       id: newId("note"), pageId, content: "",
-      contentScale: 1,
+      contentScale: 1, layer: 0,
       x: null, y: null, w: null, h: null,
       manualSize: false, manualPosition: false,
       createdAt: now, updatedAt: now
@@ -271,7 +276,7 @@
     if (!item) return null;
     return kind === "page"
       ? JSON.stringify([item.name, item.width, item.height, item.conflictOf ?? null])
-      : JSON.stringify([item.pageId, item.content, item.contentScale, item.x, item.y, item.w, item.h,
+      : JSON.stringify([item.pageId, item.content, item.contentScale, item.layer, item.x, item.y, item.w, item.h,
         item.manualSize, item.manualPosition, item.conflictOf ?? null, item.legacyTags ?? null]);
   }
 

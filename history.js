@@ -3,7 +3,7 @@
 (() => {
   "use strict";
   const MAX_BYTES = 4 * 1024 * 1024;
-  const NOTE_FIELDS = ["pageId", "content", "contentScale", "x", "y", "w", "h",
+  const NOTE_FIELDS = ["pageId", "content", "contentScale", "layer", "x", "y", "w", "h",
     "manualSize", "manualPosition", "conflictOf", "legacyTags"];
   const PAGE_FIELDS = ["name", "width", "height", "conflictOf"];
   const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
@@ -14,6 +14,8 @@
 
   function valueAt(item, field) {
     if (field === "contentScale") return { present: true, value: scale(item?.contentScale) };
+    if (field === "layer") return { present: true,
+      value: Number.isSafeInteger(item?.layer) && item.layer >= 0 ? item.layer : 0 };
     return { present: own(item, field), value: clone(item?.[field]) };
   }
 

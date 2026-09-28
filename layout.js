@@ -38,14 +38,19 @@
       a.y + a.h + GAP > b.y + EPSILON;
   }
 
-  function isValidRect(rect, existingRects, bounds, exceptId) {
+  function isWithinBounds(rect, bounds) {
     const box = normalizeRect(rect);
     const paper = normalizeBounds(bounds);
     if (!box || !paper) return false;
-    if (box.x < paper.x + MARGIN - EPSILON ||
+    return !(box.x < paper.x + MARGIN - EPSILON ||
       box.y < paper.y + MARGIN - EPSILON ||
       box.x + box.w > paper.x + paper.w - MARGIN + EPSILON ||
-      box.y + box.h > paper.y + paper.h - MARGIN + EPSILON) return false;
+      box.y + box.h > paper.y + paper.h - MARGIN + EPSILON);
+  }
+
+  function isValidRect(rect, existingRects, bounds, exceptId) {
+    const box = normalizeRect(rect);
+    if (!box || !isWithinBounds(box, bounds)) return false;
 
     for (const candidate of Array.isArray(existingRects) ? existingRects : []) {
       if (exceptId !== undefined && candidate && candidate.id === exceptId) continue;
@@ -71,7 +76,7 @@
     return result;
   }
 
-  function findPlacement(existingRects, size, bounds, preferred) {
+  function findPlacement(existingRects, size, bounds, preferred, options) {
     const paper = normalizeBounds(bounds);
     const requested = normalizeRect({ x: 0, y: 0, w: size && (size.w ?? size.width), h: size && (size.h ?? size.height) });
     if (!paper || !requested) return null;
@@ -88,6 +93,13 @@
       ? Math.max(minY, Math.min(maxY, Number(preferred.y))) : null;
     const hasPreferred = preferredX !== null && preferredY !== null;
     const occupied = (Array.isArray(existingRects) ? existingRects : []).map(normalizeRect).filter(Boolean);
+
+    // A user's saved placement is authoritative even when another card is
+    // beneath it. Automatic placement still searches for an empty gap.
+    if (hasPreferred && options && options.allowOverlap === true &&
+      isWithinBounds({ ...requested, x: preferredX, y: preferredY }, paper)) {
+      return { x: preferredX, y: preferredY };
+    }
 
     if (hasPreferred && isValidRect({ ...requested, x: preferredX, y: preferredY }, occupied, paper)) {
       return { x: preferredX, y: preferredY };
@@ -119,6 +131,46 @@
       }
     }
     return null;
+  }
+
+  function coveredArea(rects, bounds) {
+    const paper = normalizeBounds(bounds);
+    const boxes = [];
+    for (const value of Array.isArray(rects) ? rects : []) {
+      const box = normalizeRect(value);
+      if (!box) continue;
+      const left = paper ? Math.max(box.x, paper.x) : box.x;
+      const top = paper ? Math.max(box.y, paper.y) : box.y;
+      const right = paper ? Math.min(box.x + box.w, paper.x + paper.w) : box.x + box.w;
+      const bottom = paper ? Math.min(box.y + box.h, paper.y + paper.h) : box.y + box.h;
+      if (right > left && bottom > top) boxes.push({ left, top, right, bottom });
+    }
+    // Sweep vertical strips and count each covered interval only once. Stacked
+    // images therefore use their shared paper area once in the capacity meter.
+    const xs = [...new Set(boxes.flatMap(box => [box.left, box.right]))].sort((a, b) => a - b);
+    let area = 0;
+    for (let index = 1; index < xs.length; index++) {
+      const left = xs[index - 1];
+      const right = xs[index];
+      const intervals = boxes.filter(box => box.left < right && box.right > left)
+        .map(box => [box.top, box.bottom]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      let top = null;
+      let bottom = null;
+      let height = 0;
+      for (const interval of intervals) {
+        if (top === null) {
+          [top, bottom] = interval;
+        } else if (interval[0] <= bottom) {
+          bottom = Math.max(bottom, interval[1]);
+        } else {
+          height += bottom - top;
+          [top, bottom] = interval;
+        }
+      }
+      if (top !== null) height += bottom - top;
+      area += (right - left) * height;
+    }
+    return area;
   }
 
   function makeRectSize(text, measureHeight, bounds, options) {
@@ -174,6 +226,6 @@
 
   root.OnePageLayout = Object.freeze({
     MARGIN, GAP, normalizeBounds, normalizeRect,
-    makeRectSize, findPlacement, isValidRect
+    makeRectSize, findPlacement, isValidRect, isWithinBounds, coveredArea
   });
 })(typeof window !== 'undefined' ? window : globalThis);

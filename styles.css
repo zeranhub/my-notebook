@@ -48,7 +48,7 @@ body.is-touch-device .paper-touch-hint { display: block; }
 /* The A4 canvas stays 794 x 1123 logical pixels at every view zoom. */
 .canvas-viewport { --page-scale: 1; --scaled-page-width: 794px; --scaled-page-height: 1123px; position: relative; flex: 0 0 auto; width: var(--scaled-page-width); height: var(--scaled-page-height); margin: 0 auto; }
 .paper-stage { position: absolute; top: 0; left: 0; width: 794px; height: 1123px; transform: scale(var(--page-scale)); transform-origin: top left; }
-.paper-canvas { position: absolute; inset: 0; width: 794px; height: 1123px; overflow: visible; background: #fff; outline: 1px solid #dedede; }
+.paper-canvas { position: absolute; inset: 0; width: 794px; height: 1123px; overflow: visible; isolation: isolate; background: #fff; outline: 1px solid #dedede; }
 .paper-stage.is-overflowing .paper-canvas, .canvas-viewport.is-overflowing .paper-canvas { outline-color: #c7908a; }
 .overflow-badge { position: absolute; left: 50%; bottom: -12px; z-index: 20; transform: translateX(-50%); min-width: 140px; padding: 5px 10px; border: 1px solid #d7b7b3; border-radius: 3px; background: #fff; color: #9d5e58; text-align: center; font-size: 10px; font-weight: 500; }
 /* Cards blend into the page. Their full rendered contents are never clipped. */
