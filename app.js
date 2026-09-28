@@ -12,7 +12,7 @@
     touchWidthHandle: $("touchWidthHandle"), touchScaleHandle: $("touchScaleHandle"),
     undoButton: $("undoButton"), redoButton: $("redoButton"), editorUndoButton: $("editorUndoButton"), editorRedoButton: $("editorRedoButton"),
     addImageButton: $("addImageButton"), insertImageButton: $("insertImageButton"), imageFile: $("imageFile"), zoomSelect: $("zoomSelect"),
-    overflowBadge: $("overflowBadge"), overflowArea: $("overflowArea"), viewCapacityLabel: $("viewCapacityLabel"),
+    overflowBadge: $("overflowBadge"), overflowArea: $("overflowArea"),
     viewMode: $("viewMode"), editMode: $("editMode"), backButton: $("backButton"),
     editorContent: $("editorContent"), editorStatus: $("editorStatus"),
     capacityLabel: $("capacityLabel"), editorOverflow: $("editorOverflow"),
@@ -82,6 +82,7 @@
   let paperGesture = null;
   let activePaperDrag = null;
   let pendingMouseCleanup = null;
+  let mousePaperPanCleanup = null;
   let deferredView = false;
   let longPressTimer = null;
   let navigationId = crypto.randomUUID();
@@ -540,21 +541,19 @@
     const viewport = window.visualViewport;
     const height = viewport?.height || window.innerHeight;
     const offset = viewport?.offsetTop || 0;
-    document.documentElement.style.setProperty("--mobile-viewport-height",
-      `${Math.max(120, height + offset - ui.paperViewport.getBoundingClientRect().top - 24)}px`);
-    document.documentElement.style.setProperty("--mobile-editor-height",
-      `${Math.max(120, height + offset - ui.editMode.getBoundingClientRect().top - 8)}px`);
+    document.documentElement.style.setProperty("--app-viewport-height", `${Math.max(1, height)}px`);
+    document.documentElement.style.setProperty("--app-viewport-top", `${Math.max(0, offset)}px`);
   }
 
   function fitScale() {
     const page = currentPage();
     if (!page) return 1;
     const style = getComputedStyle(ui.paperViewport);
-    const width = Math.max(100, ui.paperViewport.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
-    const height = touchDevice
-      ? Math.max(100, ui.paperViewport.clientHeight - 18)
-      : Math.max(360, window.innerHeight - ui.paperViewport.getBoundingClientRect().top - 45);
-    return Math.max(0.08, Math.min(1, width / page.width, height / page.height));
+    const width = Math.max(1, ui.paperViewport.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+    const warningStyle = ui.overflowBadge.hidden ? null : getComputedStyle(ui.overflowBadge);
+    const warningHeight = warningStyle ? ui.overflowBadge.offsetHeight + parseFloat(warningStyle.marginTop) + parseFloat(warningStyle.marginBottom) : 0;
+    const height = Math.max(1, ui.paperViewport.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom) - warningHeight);
+    return Math.max(0.02, Math.min(1, width / page.width, height / page.height));
   }
 
   function paperAnchor(clientX, clientY) {
@@ -590,11 +589,46 @@
     positionTouchTools();
   }
 
+  function clampPaperScale(value) {
+    return Math.max(fitScale(), Math.min(8, Number.isFinite(value) ? value : fitScale()));
+  }
+
+  function setPaperZoom(value, anchor = viewportAnchor()) {
+    if (!unlocked || mode !== "view") return;
+    zoom = value === "fit" ? "fit" : String(clampPaperScale(Number(value)));
+    updatePaperScale(anchor);
+    if (zoom === "fit") {
+      ui.paperViewport.scrollLeft = 0;
+      ui.paperViewport.scrollTop = 0;
+      positionTouchTools();
+    }
+    savePageView();
+  }
+
+  function zoomPaperWheel(event) {
+    if (!unlocked || mode !== "view" || ui.accessDialog.open) return;
+    const overPaper = ui.paperViewport.contains(event.target) && !ui.overflowArea.contains(event.target);
+    if (!overPaper && !(event.ctrlKey || event.metaKey)) return;
+    event.preventDefault();
+    if (activeMoveCleanup || paperGesture) return;
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? ui.paperViewport.clientHeight : 1;
+    if (event.shiftKey && !(event.ctrlKey || event.metaKey)) {
+      ui.paperViewport.scrollLeft += (event.deltaX || event.deltaY) * unit;
+      savePageView();
+      positionTouchTools();
+      return;
+    }
+    const delta = Math.max(-240, Math.min(240, event.deltaY * unit));
+    if (!delta) return;
+    const anchor = overPaper ? paperAnchor(event.clientX, event.clientY) : viewportAnchor();
+    setPaperZoom(currentScale * Math.exp(-delta * 0.002), anchor);
+  }
+
   function updatePaperScale(anchor = null) {
     const page = currentPage();
     if (!page || !unlocked) return;
     updateMobileViewport();
-    currentScale = zoom === "fit" ? fitScale() : Math.max(Math.min(0.2, fitScale()), Math.min(4, Number(zoom)));
+    currentScale = zoom === "fit" ? fitScale() : clampPaperScale(Number(zoom));
     ui.viewMode.classList.toggle("is-zoomed", zoom !== "fit");
     ui.canvasViewport.style.setProperty("--page-scale", String(currentScale));
     ui.canvasViewport.style.setProperty("--scaled-page-width", `${Math.round(page.width * currentScale)}px`);
@@ -608,6 +642,7 @@
     const standard = [...ui.zoomSelect.options].some(option => option.value !== "custom" && option.value === zoom);
     custom.hidden = standard;
     custom.textContent = `${Math.round(currentScale * 100)}%`;
+    ui.zoomSelect.querySelector('option[value="fit"]').textContent = `整页 ${Math.round(fitScale() * 100)}%`;
     ui.zoomSelect.value = standard ? zoom : "custom";
     keepAnchor(anchor);
     positionTouchTools();
@@ -700,6 +735,7 @@
     if (event.pointerType !== "touch" || !unlocked || mode !== "view") return;
     if (event.target.closest("button") || paperPointers.has(event.pointerId)) return;
     if (activeMoveCleanup && !activePaperDrag) return;
+    mousePaperPanCleanup?.();
     // Cancel the browser's image callout at the initial contact, before a
     // native long-press menu can win the gesture. Touchstart has the same guard.
     event.preventDefault();
@@ -722,10 +758,11 @@
     paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (paperPointers.size === 1) {
       const card = event.target.closest(".note-card");
+      const onPaper = card && ui.canvas.contains(card);
       paperGesture = { target: event.target, down: event, startX: event.clientX, startY: event.clientY,
         left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: false, pinched: false,
-        noteId: card?.dataset.noteId || null, canDrag: card?.dataset.noteId === selectedNoteId };
-      if (card && !paperGesture.canDrag) longPressTimer = setTimeout(() => {
+        noteId: card?.dataset.noteId || null, canDrag: onPaper && card.dataset.noteId === selectedNoteId };
+      if (onPaper && !paperGesture.canDrag) longPressTimer = setTimeout(() => {
         longPressTimer = null;
         if (!paperGesture || paperGesture.moved || paperGesture.pinched || paperPointers.size !== 1) return;
         const note = byId(card.dataset.noteId);
@@ -761,8 +798,7 @@
     event.preventDefault();
     if (paperPointers.size === 2) {
       const [a, b] = [...paperPointers.values()];
-      zoom = String(Math.max(fitScale(), Math.min(4,
-        paperGesture.scale * Math.hypot(a.x - b.x, a.y - b.y) / paperGesture.distance)));
+      zoom = String(clampPaperScale(paperGesture.scale * Math.hypot(a.x - b.x, a.y - b.y) / paperGesture.distance));
       updatePaperScale({ ...paperGesture.anchor, clientX: (a.x + b.x) / 2, clientY: (a.y + b.y) / 2 });
     } else if (paperPointers.size === 1) {
       const dx = event.clientX - paperGesture.startX;
@@ -847,6 +883,50 @@
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", up);
     card.addEventListener("lostpointercapture", lost);
+  }
+
+  function beginMousePaperPan(event) {
+    if (event.pointerType === "touch" || event.button !== 0 || !unlocked || mode !== "view" ||
+        activeMoveCleanup || pendingMouseCleanup || paperGesture ||
+        event.target.closest(".note-card,button,input,select,a")) return;
+    event.preventDefault();
+    const gesture = { mousePan: true, left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop,
+      startX: event.clientX, startY: event.clientY, moved: false };
+    paperGesture = gesture;
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      ui.paperViewport.removeEventListener("lostpointercapture", lost);
+      if (mousePaperPanCleanup === cleanup) mousePaperPanCleanup = null;
+      if (paperGesture === gesture) paperGesture = null;
+      ui.paperViewport.classList.remove("is-panning");
+      if (ui.paperViewport.hasPointerCapture(event.pointerId)) ui.paperViewport.releasePointerCapture(event.pointerId);
+      if (gesture.moved) suppressClickUntil = Date.now() + 500;
+      savePageView();
+      if (deferredView) requestAnimationFrame(() => {
+        if (deferredView && unlocked && mode === "view" && !paperGesture && !activeMoveCleanup && !pendingMouseCleanup) renderView();
+      });
+    };
+    const move = moved => {
+      if (moved.pointerId !== event.pointerId) return;
+      const dx = moved.clientX - gesture.startX, dy = moved.clientY - gesture.startY;
+      if (!gesture.moved && Math.hypot(dx, dy) <= 6) return;
+      gesture.moved = true;
+      ui.paperViewport.classList.add("is-panning");
+      ui.paperViewport.scrollLeft = gesture.left - dx;
+      ui.paperViewport.scrollTop = gesture.top - dy;
+      moved.preventDefault();
+      positionTouchTools();
+    };
+    const up = released => { if (released.pointerId === event.pointerId) cleanup(); };
+    const lost = released => { if (released.pointerId === event.pointerId) cleanup(); };
+    mousePaperPanCleanup = cleanup;
+    ui.paperViewport.setPointerCapture(event.pointerId);
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    ui.paperViewport.addEventListener("lostpointercapture", lost);
   }
 
   function createCard(note, rect, overflow = false) {
@@ -1014,11 +1094,6 @@
     ui.overflowBadge.textContent = result.overflow.length
       ? `${result.overflow.length} 篇笔记越过纸张边界 ↓` : "";
     ui.canvasViewport.classList.toggle("is-overflowing", result.overflow.length > 0);
-    if (ui.viewCapacityLabel) {
-      ui.viewCapacityLabel.textContent = result.overflow.length
-        ? `${result.overflow.length} 篇越界 · 纸张已满`
-        : `已用约 ${result.percent}% · 固定 A4 空间`;
-    }
     updatePaperScale();
     updateTouchSelection();
     renderTabs();
@@ -1518,6 +1593,7 @@
     journal.reset(); historyBefore = historySelectionBefore = null;
     clearTimeout(longPressTimer); longPressTimer = null;
     pendingMouseCleanup?.();
+    mousePaperPanCleanup?.();
     activeMoveCleanup?.();
     activePaperDrag = null;
     paperPointers.clear();
@@ -1750,11 +1826,11 @@
   });
   ui.zoomSelect.addEventListener("change", () => {
     if (ui.zoomSelect.value === "custom") return;
-    const anchor = viewportAnchor();
-    zoom = ui.zoomSelect.value;
-    if (unlocked && mode === "view") { updatePaperScale(anchor); savePageView(); }
+    setPaperZoom(ui.zoomSelect.value);
   });
+  document.addEventListener("wheel", zoomPaperWheel, { capture: true, passive: false });
   ui.paperViewport.addEventListener("pointerdown", beginPaperGesture, { capture: true });
+  ui.paperViewport.addEventListener("pointerdown", beginMousePaperPan);
   ui.paperViewport.addEventListener("touchstart", event => {
     if (unlocked && mode === "view") event.preventDefault();
   }, { capture: true, passive: false });
@@ -1999,7 +2075,11 @@
   });
   document.addEventListener("keydown", event => {
     if (!unlocked || ui.accessDialog.open || !(event.ctrlKey || event.metaKey) || event.altKey) return;
-    if (event.key.toLowerCase() === "z" || (event.ctrlKey && event.key.toLowerCase() === "y")) {
+    if (mode === "view" && ["+", "=", "-", "_", "0"].includes(event.key)) {
+      event.preventDefault();
+      if (activeMoveCleanup || paperGesture) return;
+      setPaperZoom(event.key === "0" ? "fit" : currentScale * (["-", "_"].includes(event.key) ? 1 / 1.2 : 1.2));
+    } else if (event.key.toLowerCase() === "z" || (event.ctrlKey && event.key.toLowerCase() === "y")) {
       event.preventDefault();
       applyHistory(event.shiftKey || event.key.toLowerCase() === "y" ? "redo" : "undo");
     }
@@ -2020,6 +2100,7 @@
     }
   });
 
+  updateMobileViewport();
   setAccess(false);
   setStatus("pending", "一页纸已锁定");
   try { showAccess(transport.isConfigured() ? "unlock" : "setup"); }

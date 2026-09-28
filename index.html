@@ -8,15 +8,15 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.github.com; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
   <title>一页纸</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='10' y='5' width='44' height='54' rx='2' fill='%23ffffff' stroke='%23333333' stroke-width='3'/%3E%3Cpath d='M20 23h24M20 33h21M20 43h16' stroke='%23333333' stroke-width='2'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="styles.css?v=20260928-select-drag">
-  <script src="sync.js?v=20260928-select-drag" defer></script>
-  <script src="layout.js?v=20260928-select-drag" defer></script>
-  <script src="model.js?v=20260928-select-drag" defer></script>
-  <script src="history.js?v=20260928-select-drag" defer></script>
-  <script src="vendor/marked.umd.js?v=20260928-select-drag" defer></script>
-  <script src="vendor/purify.min.js?v=20260928-select-drag" defer></script>
-  <script src="markdown.js?v=20260928-select-drag" defer></script>
-  <script src="app.js?v=20260928-select-drag" defer></script>
+  <link rel="stylesheet" href="styles.css?v=20260929-paper-zoom">
+  <script src="sync.js?v=20260929-paper-zoom" defer></script>
+  <script src="layout.js?v=20260929-paper-zoom" defer></script>
+  <script src="model.js?v=20260929-paper-zoom" defer></script>
+  <script src="history.js?v=20260929-paper-zoom" defer></script>
+  <script src="vendor/marked.umd.js?v=20260929-paper-zoom" defer></script>
+  <script src="vendor/purify.min.js?v=20260929-paper-zoom" defer></script>
+  <script src="markdown.js?v=20260929-paper-zoom" defer></script>
+  <script src="app.js?v=20260929-paper-zoom" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -33,7 +33,7 @@
           <button id="undoButton" class="button button-quiet" type="button" title="撤销上一步操作" disabled>撤销</button>
           <button id="redoButton" class="button button-quiet" type="button" title="恢复刚撤销的操作（重做）" disabled>恢复</button>
           <button id="addImageButton" class="button button-quiet" type="button" title="将图片作为独立内容放到纸张上">图片</button>
-          <label class="zoom-control"><span class="sr-only">纸张显示比例</span><select id="zoomSelect" aria-label="纸张显示比例"><option value="fit">整页</option><option value="1">100%</option><option value="1.5">150%</option><option value="2">200%</option></select></label>
+          <label class="zoom-control"><span class="sr-only">纸张显示比例</span><select id="zoomSelect" aria-label="纸张显示比例" title="在纸张上滚轮缩放，拖动空白处移动查看；选择整页恢复"><option value="fit">整页</option><option value="1">100%</option><option value="1.5">150%</option><option value="2">200%</option><option value="4">400%</option><option value="8">800%</option></select></label>
           <div class="sync-status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">等待连接</span></div>
           <button id="syncButton" class="button button-quiet" type="button">同步</button>
           <button id="lockButton" class="button button-quiet" type="button">锁定</button>
@@ -49,21 +49,19 @@
 
     <main class="main-content">
       <section id="viewMode" class="view-mode" aria-label="观看一页纸" hidden>
-        <div class="paper-context"><span>我的一页纸</span><span class="paper-context-rule" aria-hidden="true"></span><span id="viewCapacityLabel">这张纸还有空间</span></div>
-        <p class="paper-touch-hint">点选 · 再点编辑 · 拖动选中框<span class="touch-pinch-hint"> · 双指缩放</span></p>
         <div id="paperViewport" class="paper-wrap" tabindex="0" aria-label="纸张查看区域，可缩放和移动查看">
           <div id="canvasViewport" class="canvas-viewport">
             <div class="paper-stage">
               <div id="canvas" class="paper-canvas" aria-label="当前纸张上的笔记"></div>
-              <div id="overflowBadge" class="overflow-badge" role="status" hidden>纸张之外还有笔记 ↓</div>
             </div>
           </div>
+          <div id="overflowBadge" class="overflow-badge" role="status" hidden>纸张之外还有笔记 ↓</div>
+          <section id="overflowArea" class="overflow-area" aria-label="纸张边界外的笔记" hidden></section>
         </div>
         <div id="touchNoteHandles" class="touch-note-handles" aria-label="所选笔记调整箭头" hidden>
           <button id="touchWidthHandle" class="touch-edge-handle" type="button" aria-label="调整横向宽度并重新换行" title="调整宽度">↔</button>
           <button id="touchScaleHandle" class="touch-edge-handle" type="button" aria-label="等比缩放文字与图片" title="缩放内容">↘</button>
         </div>
-        <section id="overflowArea" class="overflow-area" aria-label="纸张边界外的笔记" hidden></section>
       </section>
 
       <section id="editMode" class="edit-mode" aria-label="编辑笔记" hidden>
@@ -90,7 +88,6 @@
         </div>
       </section>
     </main>
-    <footer class="privacy-note">笔记同步到你的私有 GitHub 仓库。6 位 PIN 只用于解锁这台设备上的访问凭据。</footer>
   </div>
 
   <dialog id="accessDialog" class="access-dialog" aria-labelledby="accessTitle">
