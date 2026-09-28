@@ -8,6 +8,8 @@
   const ui = {
     pageTabs: $("pageTabs"), addPageButton: $("addPageButton"), renamePageButton: $("renamePageButton"),
     newNoteButton: $("newNoteButton"), canvasViewport: $("canvasViewport"), canvas: $("canvas"),
+    paperViewport: $("paperViewport"), touchNoteTools: $("touchNoteTools"),
+    touchEditButton: $("touchEditButton"), touchMoveButton: $("touchMoveButton"), touchResizeButton: $("touchResizeButton"),
     addImageButton: $("addImageButton"), insertImageButton: $("insertImageButton"), imageFile: $("imageFile"), zoomSelect: $("zoomSelect"),
     overflowBadge: $("overflowBadge"), overflowArea: $("overflowArea"), viewCapacityLabel: $("viewCapacityLabel"),
     viewMode: $("viewMode"), editMode: $("editMode"), backButton: $("backButton"),
@@ -71,6 +73,15 @@
   let pendingImageTarget = null;
   let imageBusy = false;
   let zoom = "fit";
+  // A Windows computer can report touch hardware while its active pointer is a mouse.
+  const touchDevice = matchMedia("(pointer: coarse)").matches;
+  document.body.classList.toggle("is-touch-device", touchDevice);
+  let selectedNoteId = null;
+  let activeMoveCleanup = null;
+  let paperGesture = null;
+  let deferredView = false;
+  const paperPointers = new Map();
+  const pageViews = new Map();
   const assetUrls = new Map();
   const assetLoads = new Map();
   const measurementCache = new Map();
@@ -405,18 +416,190 @@
     return { placed, overflow, percent };
   }
 
-  function updatePaperScale() {
+  function updateMobileViewport() {
+    const viewport = window.visualViewport;
+    const height = viewport?.height || window.innerHeight;
+    const offset = viewport?.offsetTop || 0;
+    document.documentElement.style.setProperty("--mobile-viewport-height",
+      `${Math.max(120, height + offset - ui.paperViewport.getBoundingClientRect().top - 24)}px`);
+    document.documentElement.style.setProperty("--mobile-editor-height",
+      `${Math.max(120, height + offset - ui.editMode.getBoundingClientRect().top - 8)}px`);
+  }
+
+  function fitScale() {
+    const page = currentPage();
+    if (!page) return 1;
+    const style = getComputedStyle(ui.paperViewport);
+    const width = Math.max(100, ui.paperViewport.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+    const height = touchDevice
+      ? Math.max(100, ui.paperViewport.clientHeight - 18)
+      : Math.max(360, window.innerHeight - ui.paperViewport.getBoundingClientRect().top - 45);
+    return Math.max(0.08, Math.min(1, width / page.width, height / page.height));
+  }
+
+  function paperAnchor(clientX, clientY) {
+    const box = ui.canvas.getBoundingClientRect();
+    return { clientX, clientY, x: (clientX - box.left) / currentScale, y: (clientY - box.top) / currentScale };
+  }
+
+  function viewportAnchor() {
+    const box = ui.paperViewport.getBoundingClientRect();
+    return paperAnchor(box.left + ui.paperViewport.clientWidth / 2,
+      box.top + Math.min(ui.paperViewport.clientHeight, window.innerHeight - box.top) / 2);
+  }
+
+  function keepAnchor(anchor) {
+    if (!anchor) return;
+    const box = ui.canvas.getBoundingClientRect();
+    ui.paperViewport.scrollLeft += box.left + anchor.x * currentScale - anchor.clientX;
+    ui.paperViewport.scrollTop += box.top + anchor.y * currentScale - anchor.clientY;
+  }
+
+  function savePageView() {
+    if (viewPageId && mode === "view") pageViews.set(viewPageId, {
+      zoom, left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop
+    });
+  }
+
+  function restorePageView(id) {
+    const view = pageViews.get(id);
+    zoom = view?.zoom || "fit";
+    updatePaperScale();
+    ui.paperViewport.scrollLeft = view?.left || 0;
+    ui.paperViewport.scrollTop = view?.top || 0;
+    positionTouchTools();
+  }
+
+  function updatePaperScale(anchor = null) {
     const page = currentPage();
     if (!page || !unlocked) return;
-    const roomWidth = Math.max(220, ui.viewMode.clientWidth - 32);
-    const roomHeight = Math.max(360, window.innerHeight - ui.viewMode.getBoundingClientRect().top - 45);
-    currentScale = zoom === "fit"
-      ? Math.max(0.2, Math.min(1, roomWidth / page.width, roomHeight / page.height))
-      : Number(zoom);
+    updateMobileViewport();
+    currentScale = zoom === "fit" ? fitScale() : Math.max(Math.min(0.2, fitScale()), Math.min(4, Number(zoom)));
     ui.viewMode.classList.toggle("is-zoomed", zoom !== "fit");
     ui.canvasViewport.style.setProperty("--page-scale", String(currentScale));
     ui.canvasViewport.style.setProperty("--scaled-page-width", `${Math.round(page.width * currentScale)}px`);
     ui.canvasViewport.style.setProperty("--scaled-page-height", `${Math.round(page.height * currentScale)}px`);
+    let custom = ui.zoomSelect.querySelector('option[value="custom"]');
+    if (!custom) {
+      custom = document.createElement("option");
+      custom.value = "custom";
+      ui.zoomSelect.append(custom);
+    }
+    const standard = [...ui.zoomSelect.options].some(option => option.value !== "custom" && option.value === zoom);
+    custom.hidden = standard;
+    custom.textContent = `${Math.round(currentScale * 100)}%`;
+    ui.zoomSelect.value = standard ? zoom : "custom";
+    keepAnchor(anchor);
+    positionTouchTools();
+  }
+
+  function selectNote(id) {
+    selectedNoteId = id;
+    updateTouchSelection();
+  }
+
+  function updateTouchSelection() {
+    const note = byId(selectedNoteId);
+    if (!note || note.pageId !== viewPageId || mode !== "view" || !unlocked) selectedNoteId = null;
+    for (const card of ui.viewMode.querySelectorAll(".note-card")) {
+      card.classList.toggle("is-selected", card.dataset.noteId === selectedNoteId);
+      card.setAttribute("aria-pressed", String(card.dataset.noteId === selectedNoteId));
+    }
+    ui.touchNoteTools.hidden = !touchDevice || !selectedNoteId;
+    const onPaper = lastLayout.placed.some(rect => rect.id === selectedNoteId);
+    ui.touchMoveButton.disabled = ui.touchResizeButton.disabled = !onPaper;
+    positionTouchTools();
+  }
+
+  function positionTouchTools() {
+    if (ui.touchNoteTools.hidden || activeMoveCleanup) return;
+    const card = [...ui.viewMode.querySelectorAll(".note-card")].find(item => item.dataset.noteId === selectedNoteId);
+    if (!card) return;
+    const box = card.getBoundingClientRect();
+    const viewport = ui.paperViewport.getBoundingClientRect();
+    const tools = ui.touchNoteTools.getBoundingClientRect();
+    const visibleBottom = Math.min(viewport.bottom, window.innerHeight) - 8;
+    const visibleTop = Math.max(8, viewport.top + 8);
+    let top = box.bottom + 8;
+    if (top + tools.height > visibleBottom) top = box.top - tools.height - 8;
+    ui.touchNoteTools.style.top = `${Math.max(visibleTop, Math.min(visibleBottom - tools.height, top))}px`;
+    ui.touchNoteTools.style.bottom = "auto";
+    ui.touchNoteTools.style.left = `${Math.max(tools.width / 2 + 10,
+      Math.min(window.innerWidth - tools.width / 2 - 10, box.left + box.width / 2))}px`;
+  }
+
+  function tapNote(id) {
+    if (selectedNoteId === id) enterEdit(id);
+    else selectNote(id);
+  }
+
+  function beginPaperGesture(event) {
+    if (!touchDevice || event.pointerType !== "touch" || !unlocked || mode !== "view" || activeMoveCleanup) return;
+    paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (paperPointers.size === 1) {
+      paperGesture = { target: event.target, down: event, startX: event.clientX, startY: event.clientY,
+        left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: false, pinched: false };
+    } else if (paperPointers.size === 2) {
+      const [a, b] = [...paperPointers.values()];
+      paperGesture.pinched = true;
+      paperGesture.scale = currentScale;
+      paperGesture.distance = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+      paperGesture.anchor = paperAnchor((a.x + b.x) / 2, (a.y + b.y) / 2);
+      suppressClickUntil = Date.now() + 500;
+    }
+    ui.paperViewport.setPointerCapture(event.pointerId);
+  }
+
+  function movePaperGesture(event) {
+    if (!paperPointers.has(event.pointerId) || !paperGesture) return;
+    event.preventDefault();
+    paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (paperPointers.size === 2) {
+      const [a, b] = [...paperPointers.values()];
+      zoom = String(Math.max(fitScale(), Math.min(4,
+        paperGesture.scale * Math.hypot(a.x - b.x, a.y - b.y) / paperGesture.distance)));
+      updatePaperScale({ ...paperGesture.anchor, clientX: (a.x + b.x) / 2, clientY: (a.y + b.y) / 2 });
+    } else if (paperPointers.size === 1) {
+      const dx = event.clientX - paperGesture.startX;
+      const dy = event.clientY - paperGesture.startY;
+      if (Math.hypot(dx, dy) > 6) paperGesture.moved = true;
+      const card = paperGesture.target.closest(".note-card");
+      if (paperGesture.moved && !paperGesture.pinched && card?.dataset.noteId === selectedNoteId) {
+        const down = paperGesture.down;
+        const note = byId(selectedNoteId);
+        paperPointers.clear();
+        paperGesture = null;
+        if (note) beginMove(down, note, card, "drag", event);
+        return;
+      }
+      if (paperGesture.moved || paperGesture.pinched) {
+        ui.paperViewport.scrollLeft = paperGesture.left - dx;
+        ui.paperViewport.scrollTop = paperGesture.top - dy;
+      }
+    }
+    positionTouchTools();
+  }
+
+  function endPaperGesture(event) {
+    if (!paperPointers.has(event.pointerId) || !paperGesture) return;
+    const gesture = paperGesture;
+    paperPointers.delete(event.pointerId);
+    if (ui.paperViewport.hasPointerCapture(event.pointerId)) ui.paperViewport.releasePointerCapture(event.pointerId);
+    if (paperPointers.size) {
+      const [remaining] = paperPointers.values();
+      gesture.startX = remaining.x; gesture.startY = remaining.y;
+      gesture.left = ui.paperViewport.scrollLeft; gesture.top = ui.paperViewport.scrollTop;
+      return;
+    }
+    paperGesture = null;
+    savePageView();
+    suppressClickUntil = Date.now() + 500;
+    if (event.type !== "pointercancel" && !gesture.moved && !gesture.pinched) {
+      const card = gesture.target.closest(".note-card");
+      if (card) tapNote(card.dataset.noteId);
+      else selectNote(null);
+    }
+    if (deferredView) { deferredView = false; if (mode === "view") renderView(); }
   }
 
   function createCard(note, rect, overflow = false) {
@@ -461,7 +644,9 @@
       card.append(resize);
     }
     card.addEventListener("click", () => {
-      if (Date.now() >= suppressClickUntil) enterEdit(note.id);
+      if (Date.now() < suppressClickUntil) return;
+      if (touchDevice) tapNote(note.id);
+      else enterEdit(note.id);
     });
     card.addEventListener("keydown", event => {
       if (event.target !== card) return;
@@ -489,6 +674,7 @@
 
   function renderView() {
     if (!unlocked) return;
+    if (paperGesture || activeMoveCleanup) { deferredView = true; return; }
     ensurePage();
     const page = currentPage();
     const result = layoutPage(page.id);
@@ -518,6 +704,7 @@
         : `已用约 ${result.percent}% · 固定 A4 空间`;
     }
     updatePaperScale();
+    updateTouchSelection();
     renderTabs();
     ensurePageImages(page.id);
   }
@@ -541,16 +728,21 @@
     ensurePage();
     ui.viewMode.hidden = mode !== "view";
     ui.editMode.hidden = mode !== "edit";
+    document.body.classList.toggle("is-editing", mode === "edit");
+    updateMobileViewport();
     if (mode === "view") renderView();
     else { renderTabs(); renderEdit(); }
   }
 
   function selectPage(id) {
     if (!unlocked || !pageById(id)) return;
+    savePageView();
+    selectedNoteId = null;
     viewPageId = id;
     mode = "view";
     editingId = null;
     render();
+    restorePageView(id);
   }
 
   function enterEdit(id, isNew = false) {
@@ -558,12 +750,14 @@
     const note = byId(id);
     if (!note) return;
     returnScroll = { x: window.scrollX, y: window.scrollY };
+    savePageView();
     viewPageId = note.pageId;
     editingId = id;
     editingWasNew = isNew;
     mode = "edit";
+    ui.touchNoteTools.hidden = true;
     render();
-    ui.editorContent.focus();
+    ui.editorContent.focus({ preventScroll: touchDevice });
     ui.editorContent.setSelectionRange(ui.editorContent.value.length, ui.editorContent.value.length);
   }
 
@@ -578,13 +772,15 @@
     if (note) viewPageId = note.pageId;
     editingId = null;
     editingWasNew = false;
+    ui.editorContent.blur();
     mode = "view";
     render();
+    restorePageView(viewPageId);
     requestAnimationFrame(() => window.scrollTo(returnScroll.x, returnScroll.y));
   }
 
-  function beginMove(event, note, card, kind) {
-    if (!unlocked || mode !== "view" || event.button !== 0) return;
+  function beginMove(event, note, card, kind, firstMove = null) {
+    if (!unlocked || mode !== "view" || event.button !== 0 || activeMoveCleanup || paperGesture) return;
     event.preventDefault();
     event.stopPropagation();
     const page = currentPage();
@@ -594,6 +790,7 @@
     const start = { x: placed.x, y: placed.y, w: placed.w, h: placed.h };
     const origin = { x: event.clientX, y: event.clientY };
     const existing = lastLayout.placed.filter(rect => rect.id !== note.id);
+    const moveScale = currentScale;
     let candidate = { ...start };
     let moved = false;
     card.classList.add("is-moving");
@@ -606,8 +803,10 @@
     };
     const onMove = move => {
       if (move.pointerId !== event.pointerId) return;
-      const dx = (move.clientX - origin.x) / currentScale;
-      const dy = (move.clientY - origin.y) / currentScale;
+      if (!unlocked) return;
+      move.preventDefault();
+      const dx = (move.clientX - origin.x) / moveScale;
+      const dy = (move.clientY - origin.y) / moveScale;
       if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
       let next;
       if (kind === "drag") next = {
@@ -638,26 +837,38 @@
       card.style.width = `${next.w}px`;
       card.style.height = `${next.h}px`;
     };
-    const onUp = up => {
-      if (up.pointerId !== event.pointerId) return;
+    const cleanup = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
+      activeMoveCleanup = null;
+      if (event.target.hasPointerCapture?.(event.pointerId)) event.target.releasePointerCapture(event.pointerId);
       card.classList.remove("is-moving");
+    };
+    const onUp = up => {
+      if (up.pointerId !== event.pointerId) return;
+      cleanup();
+      if (!unlocked) return;
       if (moved) suppressClickUntil = Date.now() + 350;
-      if (!equal(candidate, start)) {
-        note.x = candidate.x; note.y = candidate.y;
-        note.w = candidate.w; note.h = candidate.h;
-        if (kind === "drag") note.manualPosition = true;
-        else { note.manualPosition = true; note.manualSize = true; }
-        note.updatedAt = now();
+      // A background sync can replace the document while the pointer is held.
+      const currentNote = byId(note.id);
+      if (up.type !== "pointercancel" && currentNote?.pageId === page.id && !equal(candidate, start)) {
+        currentNote.x = candidate.x; currentNote.y = candidate.y;
+        currentNote.w = candidate.w; currentNote.h = candidate.h;
+        if (kind === "drag") currentNote.manualPosition = true;
+        else { currentNote.manualPosition = true; currentNote.manualSize = true; }
+        currentNote.updatedAt = now();
         changed();
       }
       renderView();
+      deferredView = false;
     };
-    window.addEventListener("pointermove", onMove);
+    activeMoveCleanup = cleanup;
+    event.target.setPointerCapture?.(event.pointerId);
+    window.addEventListener("pointermove", onMove, { passive: false });
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
+    if (firstMove) onMove(firstMove);
   }
 
   function queueDraft() {
@@ -867,6 +1078,15 @@
     }
     session++;
     unlocked = false;
+    activeMoveCleanup?.();
+    paperPointers.clear();
+    paperGesture = null;
+    deferredView = false;
+    selectedNoteId = null;
+    pageViews.clear();
+    zoom = "fit";
+    ui.touchNoteTools.hidden = true;
+    document.body.classList.remove("is-editing");
     imageBusy = false;
     imageTarget = null;
     pendingImageTarget = null;
@@ -1081,9 +1301,24 @@
     requestSync(true);
   });
   ui.zoomSelect.addEventListener("change", () => {
+    if (ui.zoomSelect.value === "custom") return;
+    const anchor = viewportAnchor();
     zoom = ui.zoomSelect.value;
-    if (unlocked && mode === "view") updatePaperScale();
+    if (unlocked && mode === "view") { updatePaperScale(anchor); savePageView(); }
   });
+  ui.paperViewport.addEventListener("pointerdown", beginPaperGesture);
+  ui.paperViewport.addEventListener("pointermove", movePaperGesture, { passive: false });
+  ui.paperViewport.addEventListener("pointerup", endPaperGesture);
+  ui.paperViewport.addEventListener("pointercancel", endPaperGesture);
+  ui.touchEditButton.addEventListener("click", () => { if (selectedNoteId) enterEdit(selectedNoteId); });
+  for (const [button, kind] of [[ui.touchMoveButton, "drag"], [ui.touchResizeButton, "resize"]]) {
+    button.addEventListener("pointerdown", event => {
+      const note = byId(selectedNoteId);
+      const card = [...ui.canvas.children].find(item => item.dataset.noteId === selectedNoteId);
+      if (note && card) beginMove(event, note, card, kind);
+    });
+    button.addEventListener("click", event => event.preventDefault());
+  }
   ui.addImageButton.addEventListener("click", () => chooseImage(true));
   ui.insertImageButton.addEventListener("click", () => chooseImage(false));
   ui.imageFile.addEventListener("change", () => {
@@ -1120,12 +1355,15 @@
     if (!unlocked || (!remoteReady && !state.pages.length)) return;
     if (state.pages.length >= 100) { toast("最多可建立 100 张一页纸。" ); return; }
     const page = Model.createPage(state.pages.length, PAPER_WIDTH, PAPER_HEIGHT);
+    savePageView();
+    selectedNoteId = null;
     state.pages.push(page);
     viewPageId = page.id;
     state.activePageId = page.id;
     mode = "view";
     changed();
     render();
+    restorePageView(page.id);
   });
   ui.renamePageButton.addEventListener("click", () => {
     if (!unlocked) return;
@@ -1183,9 +1421,12 @@
     state.notes = state.notes.filter(item => item.id !== note.id);
     editingId = null;
     editingWasNew = false;
+    selectedNoteId = null;
+    ui.editorContent.blur();
     mode = "view";
     changed();
     render();
+    restorePageView(viewPageId);
     requestAnimationFrame(() => window.scrollTo(returnScroll.x, returnScroll.y));
     toast("笔记已删除。" );
   });
@@ -1283,7 +1524,15 @@
   document.addEventListener("visibilitychange", () => {
     if (unlocked && document.visibilityState === "visible") requestSync(true);
   });
-  window.addEventListener("resize", () => { if (unlocked && mode === "view") updatePaperScale(); });
+  function resizeViewport() {
+    updateMobileViewport();
+    if (unlocked && mode === "view" && !paperGesture && !activeMoveCleanup) {
+      updatePaperScale(viewportAnchor());
+    }
+  }
+  window.addEventListener("resize", resizeViewport);
+  window.visualViewport?.addEventListener("resize", resizeViewport);
+  window.visualViewport?.addEventListener("scroll", updateMobileViewport);
   window.addEventListener("beforeunload", event => {
     if (unlocked && (draftPending > 0 || draftFailed || imageBusy)) {
       event.preventDefault();

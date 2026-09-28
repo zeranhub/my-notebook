@@ -41,7 +41,10 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
 .view-mode { padding: 13px 16px 32px; }
 .paper-context { display: flex; align-items: center; justify-content: center; gap: 9px; margin-bottom: 9px; color: #aaa; font-size: 10px; }
 .paper-context-rule { width: 17px; height: 1px; background: #e4e4e4; }
-.paper-wrap { display: block; width: 100%; min-width: 0; overflow: auto; padding: 1px 1px 16px; }
+.paper-touch-hint { display: none; margin: 0 0 7px; color: #999; font-size: 10px; line-height: 1.4; text-align: center; }
+body.is-touch-device .paper-touch-hint { display: block; }
+.paper-wrap { display: block; width: 100%; min-width: 0; overflow: auto; padding: 1px 1px 16px; -webkit-overflow-scrolling: touch; }
+.paper-wrap:focus-visible { outline: 1px solid #aaa; outline-offset: 2px; }
 /* The A4 canvas stays 794 x 1123 logical pixels at every view zoom. */
 .canvas-viewport { --page-scale: 1; --scaled-page-width: 794px; --scaled-page-height: 1123px; position: relative; flex: 0 0 auto; width: var(--scaled-page-width); height: var(--scaled-page-height); margin: 0 auto; }
 .paper-stage { position: absolute; top: 0; left: 0; width: 794px; height: 1123px; transform: scale(var(--page-scale)); transform-origin: top left; }
@@ -51,6 +54,14 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
 /* Cards blend into the page. Their full rendered contents are never clipped. */
 .note-card { position: absolute; overflow: visible; min-width: 20px; min-height: 16px; border: 1px solid transparent; border-radius: 0; background: transparent; color: #262626; box-shadow: none; cursor: pointer; touch-action: auto; }
 .note-card:hover, .note-card:focus-visible, .note-card:focus-within, .note-card.is-moving, .note-card.is-resizing { border-color: #c8c8c8; }
+.note-card.is-selected { border-color: #7c7c7c; outline: 1px solid #7c7c7c; outline-offset: 0; }
+/* Touch controls sit outside the scaled paper, so their hit areas stay screen-sized. */
+.touch-note-tools { position: fixed; z-index: 25; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 2px; width: max-content; max-width: calc(100vw - 24px); padding: 4px; transform: translateX(-50%); border: 1px solid #dedede; border-radius: 8px; background: #fff; box-shadow: 0 3px 16px #00000012; }
+.touch-tool { flex: 0 0 auto; min-width: 60px; height: 44px; padding: 8px 13px; border: 0; border-radius: 5px; background: transparent; color: #444; font-size: 14px; line-height: 1; white-space: nowrap; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.touch-tool:hover, .touch-tool:active, .touch-tool[aria-pressed="true"] { background: #f0f0f0; color: #222; }
+#touchMoveButton, #touchResizeButton { touch-action: none; user-select: none; -webkit-user-select: none; }
+body.is-touch-device .note-card .drag-handle, body.is-touch-device .note-card .resize-handle { display: none; }
+body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webkit-user-select: none; }
 .note-card-content { white-space: normal; overflow-wrap: anywhere; word-break: normal; overflow: visible; padding: 3px; font-size: 8px; line-height: 1.25; }
 .note-card-content > :first-child { margin-top: 0; }
 .note-card-content > :last-child { margin-bottom: 0; }
@@ -140,27 +151,43 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
   .page-navigation { grid-column: 1 / -1; grid-row: 2; }
   .topbar-actions { grid-column: 2; grid-row: 1; justify-self: end; }
 }
-@media (max-width: 740px) {
-  .topbar-main { grid-template-columns: minmax(0,1fr); padding: 9px 12px; gap: 4px; }
+@media (max-width: 740px), (pointer: coarse) {
+  .topbar-main { grid-template-columns: auto minmax(0,1fr); padding: 4px max(10px,env(safe-area-inset-right)) 4px max(10px,env(safe-area-inset-left)); gap: 2px 10px; }
   .brand { grid-column: 1; grid-row: 1; font-size: 14px; }
-  .page-navigation { grid-column: 1; grid-row: 2; width: 100%; }
+  .page-navigation { grid-column: 2; grid-row: 1; width: 100%; gap: 1px; }
   .page-tabs { flex: 1; }
-  .topbar-actions { grid-column: 1; grid-row: 3; justify-self: stretch; min-width: 0; flex-wrap: wrap; gap: 2px; }
-  .topbar-actions .button { min-height: 29px; padding: 5px 6px; font-size: 11px; }
-  .sync-status { margin-left: auto; }
-  .view-mode { padding: 11px 10px 25px; }
-  .paper-context { margin-bottom: 8px; }
-  .edit-mode { padding: 10px 12px 24px; }
-  .editor-panel { min-height: calc(100vh - 190px); padding: 12px 2px; }
-  .editor-toolbar { gap: 7px; margin-bottom: 10px; }
-  .editor-content { min-height: 300px; font-size: 16px; }
-  .editor-footer { align-items: flex-start; flex-direction: column; }
-  .editor-actions { width: 100%; justify-content: flex-end; }
+  .page-tabs > button, .page-tab { min-height: 40px; padding: 7px 10px; max-width: 130px; }
+  .icon-button { width: 40px; height: 40px; }
+  .topbar-actions { grid-column: 1 / -1; grid-row: 2; justify-self: stretch; min-width: 0; flex-wrap: nowrap; gap: 2px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .topbar-actions::-webkit-scrollbar { display: none; }
+  .topbar-actions > *, .backup-actions { flex: 0 0 auto; }
+  .topbar-actions .button { min-width: 44px; min-height: 44px; padding: 7px 10px; font-size: 12px; }
+  .topbar-actions .button-primary { padding-inline: 12px; }
+  .zoom-control select { min-width: 66px; height: 44px; padding-inline: 6px; font-size: 12px; }
+  .sync-status { max-width: 85px; padding: 0 6px; font-size: 10px; }
+  .view-mode { padding: 7px max(10px,env(safe-area-inset-right)) 12px max(10px,env(safe-area-inset-left)); }
+  .paper-context { min-height: 18px; margin-bottom: 6px; }
+  .paper-wrap { height: var(--mobile-viewport-height,calc(100vh - 142px)); height: var(--mobile-viewport-height,calc(100dvh - 142px)); min-height: 160px; padding: 2px 2px 16px; overflow: auto; }
+  .edit-mode { height: var(--mobile-editor-height,100vh); height: var(--mobile-editor-height,100dvh); min-height: 0; padding: 0 max(12px,env(safe-area-inset-right)) env(safe-area-inset-bottom) max(12px,env(safe-area-inset-left)); overflow: hidden; }
+  .editor-panel { height: 100%; min-height: 0; padding: 0; }
+  .editor-toolbar { flex: 0 0 auto; gap: 6px; margin: 0; min-height: 54px; padding-top: env(safe-area-inset-top); border-bottom: 1px solid #eee; }
+  .editor-toolbar .button { min-height: 44px; padding: 8px 10px; font-size: 14px; }
+  .editor-toolbar .button-back { padding-left: 4px; }
+  .editor-status { max-width: 88px; font-size: 10px; }
+  .editor-content { flex: 1 1 auto; min-height: 0; resize: none; padding: 14px 2px 16px; font-size: 16px; line-height: 1.65; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .editor-footer { flex: 0 0 auto; align-items: center; flex-direction: row; gap: 8px; padding: 6px 0; }
+  .editor-capacity { flex: 1 1 auto; max-width: 50%; }
+  .editor-actions { flex: 0 0 auto; width: auto; justify-content: flex-end; }
+  .editor-actions .button { min-height: 40px; padding-inline: 7px; font-size: 11px; }
+  body.is-editing .topbar, body.is-editing .privacy-note, body.is-editing .touch-note-tools, body:has(#editMode:not([hidden])) .topbar, body:has(#editMode:not([hidden])) .privacy-note, body:has(#editMode:not([hidden])) .touch-note-tools { display: none; }
+  body.is-editing .app-shell, body:has(#editMode:not([hidden])) .app-shell { min-height: 0; height: var(--mobile-editor-height,100dvh); }
+  body.is-editing .main-content, body:has(#editMode:not([hidden])) .main-content { min-height: 0; }
   .access-dialog { padding: 22px 19px; }
+  .access-field input { font-size: 16px; }
   .pin-fields { grid-template-columns: 1fr; gap: 0; }
+  .privacy-note { padding-bottom: max(8px,env(safe-area-inset-bottom)); }
 }
 @media (pointer: coarse) {
-  .drag-handle { width: 32px; height: 32px; top: -16px; left: -16px; }
-  .resize-handle { width: 32px; height: 32px; right: -16px; bottom: -16px; }
+  .note-card .drag-handle, .note-card .resize-handle { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .button, .toast { transition: none; } }
