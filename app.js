@@ -38,7 +38,7 @@
     assets: value.assets || {},
     pages: value.pages.map(p => [p.id, p.name, p.width, p.height, p.conflictOf || null]),
     notes: value.notes.map(n => [n.id, n.pageId, n.content, n.x, n.y, n.w, n.h,
-      n.manualSize, n.manualPosition, n.conflictOf || null, n.legacyTags || null])
+      n.manualSize, n.manualPosition, n.contentScale ?? 1, n.conflictOf || null, n.legacyTags || null])
   });
   const now = () => new Date().toISOString();
   const byId = id => state.notes.find(note => note.id === id);
@@ -328,22 +328,64 @@
   measurement.style.maxHeight = "none";
   document.body.append(measurement);
 
-  function measureHeight(width, text) {
-    const roundedWidth = Math.ceil(width);
-    let heights = measurementCache.get(text);
-    if (heights?.has(roundedWidth)) return heights.get(roundedWidth);
-    measurement.style.width = `${Math.ceil(width)}px`;
+  function noteScale(note) {
+    return Number.isFinite(note.contentScale) ? Math.max(0.25, Math.min(8, note.contentScale)) : 1;
+  }
+
+  function measureBaseSize(width, text) {
+    const roundedWidth = Math.max(8, Math.round(width * 64) / 64);
+    let sizes = measurementCache.get(text);
+    if (sizes?.has(roundedWidth)) return sizes.get(roundedWidth);
+    measurement.style.width = `${roundedWidth}px`;
     measurement.style.height = "auto";
     renderBody(measurementContent, text || " ");
-    const height = Math.ceil(Math.max(measurement.scrollHeight, measurement.getBoundingClientRect().height));
-    measurementContent.replaceChildren();
-    if (!heights) {
-      if (measurementCache.size >= 64) measurementCache.delete(measurementCache.keys().next().value);
-      heights = new Map();
-      measurementCache.set(text, heights);
+    let tightWidth = roundedWidth;
+    // Text ranges exclude the unused right side of a short paragraph. Visible
+    // block backgrounds, tables and images still reserve their complete width.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const box = measurement.getBoundingClientRect();
+      const contentBox = measurementContent.getBoundingClientRect();
+      const padding = parseFloat(getComputedStyle(measurementContent).paddingRight);
+      let right = contentBox.left + padding;
+      const walker = document.createTreeWalker(measurementContent, NodeFilter.SHOW_TEXT);
+      const range = document.createRange();
+      while (walker.nextNode()) {
+        range.selectNodeContents(walker.currentNode);
+        for (const rect of range.getClientRects()) if (rect.height > 0) right = Math.max(right, rect.right);
+      }
+      for (const block of measurementContent.querySelectorAll("pre,table,.md-image,blockquote,hr,input,code")) {
+        right = Math.max(right, block.getBoundingClientRect().right);
+      }
+      const nextWidth = Math.min(tightWidth, Math.max(8,
+        Math.ceil((right - box.left + padding + 1) * 64) / 64));
+      if (tightWidth - nextWidth < 1 / 64) break;
+      tightWidth = nextWidth;
+      measurement.style.width = `${tightWidth}px`;
     }
-    heights.set(roundedWidth, height);
-    return height;
+    const height = measurement.getBoundingClientRect().height;
+    const size = { w: tightWidth, h: height };
+    measurementContent.replaceChildren();
+    if (!sizes) {
+      if (measurementCache.size >= 64) measurementCache.delete(measurementCache.keys().next().value);
+      sizes = new Map();
+      measurementCache.set(text, sizes);
+    }
+    if (sizes.size >= 160) sizes.delete(sizes.keys().next().value);
+    sizes.set(roundedWidth, size);
+    sizes.set(tightWidth, size);
+    return size;
+  }
+
+  function contentSize(width, text, scale = 1) {
+    const base = measureBaseSize(2 + Math.max(6, (width - 2) / scale), text);
+    return { w: 2 + (base.w - 2) * scale, h: 2 + (base.h - 2) * scale,
+      contentWidth: base.w - 2, contentHeight: base.h - 2, contentScale: scale };
+  }
+
+  function styleCardContent(content, size) {
+    content.style.width = `${size.contentWidth}px`;
+    content.style.transformOrigin = "top left";
+    content.style.transform = `scale(${size.contentScale})`;
   }
 
   function fitAlternative(note, page, placed, preferred) {
@@ -355,13 +397,14 @@
       widths.add(Math.floor((maxWidth - (columns - 1) * Layout.GAP) / columns));
     }
     let best = null;
+    const scale = noteScale(note);
     for (const w of widths) {
-      const h = Math.ceil(Math.max(20, measureHeight(w, note.content) + 1));
-      if (h > maxHeight) continue;
-      const position = Layout.findPlacement(placed, { w, h }, page, preferred);
+      const size = contentSize(w, note.content, scale);
+      if (size.h > maxHeight) continue;
+      const position = Layout.findPlacement(placed, size, page, preferred);
       if (!position) continue;
-      const score = w * h * (1 + 0.1 * Math.abs(Math.log(w / h / 1.25)));
-      if (!best || score < best.score) best = { size: { w, h }, position, score };
+      const score = size.w * size.h * (1 + 0.1 * Math.abs(Math.log(size.w / size.h / 1.25)));
+      if (!best || score < best.score) best = { size, position, score };
     }
     return best;
   }
@@ -369,22 +412,24 @@
   function desiredSize(note, page) {
     const bounds = { w: page.width, h: page.height };
     const margin = Layout.MARGIN;
-    if (note.manualSize && Number.isFinite(note.w) && Number.isFinite(note.h)) {
-      const w = Math.max(96, Math.min(page.width - margin * 2, Math.ceil(note.w)));
-      const h = Math.max(18, Math.ceil(note.h), measureHeight(w, note.content) + 1);
-      return h <= page.height - margin * 2 ? { w, h } : null;
+    const scale = noteScale(note);
+    const maxWidth = page.width - margin * 2;
+    const maxHeight = page.height - margin * 2;
+    if (note.manualSize && Number.isFinite(note.w)) {
+      const size = contentSize(Math.max(2 + 6 * scale, Math.min(maxWidth, note.w)), note.content, scale);
+      return size.h <= maxHeight ? size : null;
     }
     const picture = /^\s*!\[[^\]]*\]\(onepage:([A-Za-z0-9_-]+)\)\s*$/.exec(note.content);
     if (picture && state.assets[picture[1]]) {
-      const w = Math.min(180, page.width - margin * 2);
-      const h = Math.ceil(measureHeight(w, note.content) + 1);
-      return h <= page.height - margin * 2 ? { w, h } : null;
+      const size = contentSize(Math.min(2 + 178 * scale, maxWidth), note.content, scale);
+      return size.h <= maxHeight ? size : null;
     }
-    return Layout.makeRectSize(note.content, measureHeight, bounds, {
-      minWidth: 112, minHeight: 20, maxWidth: page.width - margin * 2,
-      extraHeight: 1,
+    const preferred = Layout.makeRectSize(note.content, (width, text) => contentSize(width, text, scale).h, bounds, {
+      minWidth: Math.min(maxWidth, 2 + 110 * scale), minHeight: 1, maxWidth,
+      extraHeight: 0,
       preferredWidth: Number.isFinite(note.w) ? note.w : undefined
     });
+    return preferred ? contentSize(preferred.w, note.content, scale) : null;
   }
 
   function layoutPage(pageId) {
@@ -408,7 +453,7 @@
         if (alternative) { size = alternative.size; position = alternative.position; }
       }
       if (!position) { overflow.push(note); continue; }
-      const rect = { id: note.id, x: position.x, y: position.y, w: size.w, h: size.h };
+      const rect = { id: note.id, x: position.x, y: position.y, ...size };
       placed.push(rect);
     }
     const usable = Math.max(1, (page.width - Layout.MARGIN * 2) * (page.height - Layout.MARGIN * 2));
@@ -632,13 +677,23 @@
     const content = document.createElement("div");
     content.className = "note-card-content";
     renderBody(content, note.content);
-    card.append(content);
+    if (rect) styleCardContent(content, rect);
+    else {
+      const size = contentSize(Math.min(782, ui.overflowArea.clientWidth || Math.max(80, window.innerWidth - 34)), note.content, noteScale(note));
+      styleCardContent(content, size);
+      card.style.setProperty("--overflow-note-width", `${size.w}px`);
+      card.style.setProperty("--overflow-note-height", `${size.h}px`);
+    }
+    const frame = document.createElement("div");
+    frame.className = "note-content-frame";
+    frame.append(content);
+    card.append(frame);
     if (!overflow) {
       const resize = document.createElement("button");
       resize.type = "button";
       resize.className = "resize-handle";
-      resize.setAttribute("aria-label", "调整笔记框大小");
-      resize.title = "调整大小";
+      resize.setAttribute("aria-label", "缩放正文和图片，内容框自动贴合");
+      resize.title = "等比缩放内容";
       resize.addEventListener("pointerdown", event => beginMove(event, note, card, "resize"));
       resize.addEventListener("click", event => event.stopPropagation());
       card.append(resize);
@@ -791,6 +846,9 @@
     const origin = { x: event.clientX, y: event.clientY };
     const existing = lastLayout.placed.filter(rect => rect.id !== note.id);
     const moveScale = currentScale;
+    const initialScale = noteScale(note);
+    let candidateScale = initialScale;
+    const content = card.querySelector(".note-card-content");
     let candidate = { ...start };
     let moved = false;
     card.classList.add("is-moving");
@@ -815,11 +873,26 @@
         y: edge(start.y + dy, margin, page.height - margin - start.h)
       };
       else {
-        const w = edge(start.w + dx, 96, page.width - margin - start.x);
-        const minimumHeight = Math.max(18, measureHeight(w, note.content) + 1);
-        const maximumHeight = page.height - margin - start.y;
-        if (minimumHeight > maximumHeight) return;
-        next = { ...start, w, h: edge(start.h + dy, minimumHeight, maximumHeight) };
+        const innerWidth = start.w - 2, innerHeight = start.h - 2;
+        const factor = 1 + (dx * innerWidth + dy * innerHeight) / (innerWidth ** 2 + innerHeight ** 2);
+        const maximum = Math.min(8 / initialScale,
+          (page.width - margin - start.x - 2) / innerWidth,
+          (page.height - margin - start.y - 2) / innerHeight);
+        let bounded = Math.max(0.25 / initialScale, Math.min(maximum, factor));
+        const scaledRect = value => ({ ...start, w: 2 + innerWidth * value, h: 2 + innerHeight * value });
+        next = scaledRect(bounded);
+        if (!Layout.isValidRect(next, existing, page)) {
+          // Find the largest valid enlargement before another note or the edge.
+          let low = 1, high = bounded;
+          for (let attempt = 0; attempt < 18; attempt++) {
+            const middle = (low + high) / 2;
+            if (Layout.isValidRect(scaledRect(middle), existing, page)) low = middle;
+            else high = middle;
+          }
+          bounded = low;
+          next = scaledRect(bounded);
+        }
+        candidateScale = Math.max(0.25, Math.min(8, initialScale * bounded));
       }
       if (!Layout.isValidRect(next, existing, { w: page.width, h: page.height })) {
         if (kind === "drag") {
@@ -836,6 +909,7 @@
       card.style.top = `${next.y}px`;
       card.style.width = `${next.w}px`;
       card.style.height = `${next.h}px`;
+      if (kind === "resize") content.style.transform = `scale(${candidateScale})`;
     };
     const cleanup = () => {
       window.removeEventListener("pointermove", onMove);
@@ -856,7 +930,10 @@
         currentNote.x = candidate.x; currentNote.y = candidate.y;
         currentNote.w = candidate.w; currentNote.h = candidate.h;
         if (kind === "drag") currentNote.manualPosition = true;
-        else { currentNote.manualPosition = true; currentNote.manualSize = true; }
+        else {
+          currentNote.manualPosition = true; currentNote.manualSize = true;
+          currentNote.contentScale = candidateScale;
+        }
         currentNote.updatedAt = now();
         changed();
       }
@@ -1159,6 +1236,7 @@
       note.content = oldNote.content;
       note.x = oldNote.x; note.y = oldNote.y;
       note.w = oldNote.w; note.h = oldNote.h;
+      note.contentScale = oldNote.contentScale;
       note.manualSize = oldNote.manualSize;
       note.manualPosition = oldNote.manualPosition;
       note.createdAt = oldNote.createdAt;

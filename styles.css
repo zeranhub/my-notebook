@@ -52,7 +52,10 @@ body.is-touch-device .paper-touch-hint { display: block; }
 .paper-stage.is-overflowing .paper-canvas, .canvas-viewport.is-overflowing .paper-canvas { outline-color: #c7908a; }
 .overflow-badge { position: absolute; left: 50%; bottom: -12px; z-index: 20; transform: translateX(-50%); min-width: 140px; padding: 5px 10px; border: 1px solid #d7b7b3; border-radius: 3px; background: #fff; color: #9d5e58; text-align: center; font-size: 10px; font-weight: 500; }
 /* Cards blend into the page. Their full rendered contents are never clipped. */
-.note-card { position: absolute; overflow: visible; min-width: 20px; min-height: 16px; border: 1px solid transparent; border-radius: 0; background: transparent; color: #262626; box-shadow: none; cursor: pointer; touch-action: auto; }
+.note-card { position: absolute; overflow: visible; min-width: 0; min-height: 0; border: 1px solid transparent; border-radius: 0; background: transparent; color: #262626; box-shadow: none; cursor: pointer; touch-action: auto; }
+/* Full measured content fits here; the wrapper prevents its unscaled layout
+   box from creating phantom scroll space when the content is shrunk. */
+.note-content-frame { position: absolute; inset: 0; overflow: clip; }
 .note-card:hover, .note-card:focus-visible, .note-card:focus-within, .note-card.is-moving, .note-card.is-resizing { border-color: #c8c8c8; }
 .note-card.is-selected { border-color: #7c7c7c; outline: 1px solid #7c7c7c; outline-offset: 0; }
 /* Touch controls sit outside the scaled paper, so their hit areas stay screen-sized. */
@@ -91,6 +94,7 @@ body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webki
 .note-card-content .md-image-placeholder { display: grid; place-items: center; padding: 4px; background: #fafafa; color: #aaa; font-size: 8px; text-align: center; }
 .note-card-content .md-external-image { color: #999; }
 .note-card-content.is-image-only p, .note-card-content.is-image-only .md-image { margin: 0; }
+.note-card-content.is-image-only { padding: 0; }
 .note-card-content input[type="checkbox"] { width: .9em; height: .9em; margin: 0 .25em 0 0; accent-color: #555; vertical-align: -.1em; }
 .note-card-content .plain-text { white-space: pre-wrap; }
 .drag-handle, .resize-handle { position: absolute; z-index: 2; display: grid; place-items: center; padding: 0; border: 0; border-radius: 2px; background: transparent; color: #888; opacity: 0; touch-action: none; }
@@ -102,7 +106,7 @@ body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webki
 .note-card:hover .drag-handle, .note-card:hover .resize-handle, .note-card:focus-visible .drag-handle, .note-card:focus-visible .resize-handle, .note-card:focus-within .drag-handle, .note-card:focus-within .resize-handle, .note-card.is-moving .drag-handle, .note-card.is-resizing .resize-handle { opacity: 1; }
 .overflow-area { display: flex; flex-direction: column; gap: 12px; width: min(794px,calc(100vw - 32px)); margin: 23px auto 0; padding: 16px 0 5px; border-top: 1px dashed #c7908a; }
 .overflow-heading { margin: 0; color: #a16e68; font-size: 11px; font-weight: 500; line-height: 1.5; }
-.overflow-area .note-card { position: relative !important; left: auto !important; top: auto !important; right: auto !important; bottom: auto !important; width: 100% !important; height: auto !important; min-height: 16px; transform: none !important; touch-action: auto; }
+.overflow-area .note-card { position: relative !important; left: auto !important; top: auto !important; right: auto !important; bottom: auto !important; width: var(--overflow-note-width,100%) !important; height: var(--overflow-note-height,auto) !important; min-height: 0; transform: none !important; touch-action: auto; }
 .overflow-area .note-card-content { overflow: visible; }
 .overflow-area .note-card.is-overflow { border-color: transparent; background: transparent; }
 .overflow-area .note-card.is-overflow:hover, .overflow-area .note-card.is-overflow:focus-within { border-color: #c7908a; }
