@@ -59,13 +59,12 @@ body.is-touch-device .paper-touch-hint { display: block; }
 .note-card:hover, .note-card:focus-visible, .note-card:focus-within, .note-card.is-moving, .note-card.is-resizing { border-color: #c8c8c8; }
 .note-card.is-selected { border-color: #7c7c7c; outline: 1px solid #7c7c7c; outline-offset: 0; }
 /* Touch controls sit outside the scaled paper, so their hit areas stay screen-sized. */
-.touch-note-tools { position: fixed; z-index: 25; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 2px; width: max-content; max-width: calc(100vw - 24px); padding: 4px; transform: translateX(-50%); border: 1px solid #dedede; border-radius: 8px; background: #fff; box-shadow: 0 3px 16px #00000012; }
-.touch-tool { flex: 0 0 auto; min-width: 60px; height: 44px; padding: 8px 13px; border: 0; border-radius: 5px; background: transparent; color: #444; font-size: 14px; line-height: 1; white-space: nowrap; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-.touch-tool:hover, .touch-tool:active, .touch-tool[aria-pressed="true"] { background: #f0f0f0; color: #222; }
-#touchMoveButton, #touchResizeButton { touch-action: none; user-select: none; -webkit-user-select: none; }
-body.is-touch-device .note-card .drag-handle, body.is-touch-device .note-card .resize-handle { display: none; }
+.touch-edge-handle { position: fixed; z-index: 25; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; transform: translate(-50%,-50%); border: 0; border-radius: 50%; background: transparent; color: #555; font-size: 18px; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+.touch-edge-handle::before { content: ""; position: absolute; inset: 11px; z-index: -1; border: 1px solid #bbb; border-radius: 50%; background: #fff; }
+.touch-edge-handle:active::before { background: #f0f0f0; }
+body.is-touch-device .note-card .drag-handle, body.is-touch-device .note-card .resize-handle, body.is-touch-device .note-card .width-handle { display: none; }
 body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webkit-user-select: none; }
-.note-card-content { white-space: normal; overflow-wrap: anywhere; word-break: normal; overflow: visible; padding: 3px; font-size: 8px; line-height: 1.25; }
+.note-card-content { white-space: normal; overflow-wrap: anywhere; word-break: normal; overflow: visible; padding: 1px; font-size: 8px; line-height: 1.25; }
 .note-card-content > :first-child { margin-top: 0; }
 .note-card-content > :last-child { margin-bottom: 0; }
 .note-card-content p { margin: 0 0 .3em; white-space: pre-wrap; }
@@ -97,13 +96,15 @@ body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webki
 .note-card-content.is-image-only { padding: 0; }
 .note-card-content input[type="checkbox"] { width: .9em; height: .9em; margin: 0 .25em 0 0; accent-color: #555; vertical-align: -.1em; }
 .note-card-content .plain-text { white-space: pre-wrap; }
-.drag-handle, .resize-handle { position: absolute; z-index: 2; display: grid; place-items: center; padding: 0; border: 0; border-radius: 2px; background: transparent; color: #888; opacity: 0; touch-action: none; }
+.drag-handle, .resize-handle, .width-handle { position: absolute; z-index: 2; display: grid; place-items: center; padding: 0; border: 0; border-radius: 2px; background: transparent; color: #888; opacity: 0; touch-action: none; }
 .drag-handle { top: -9px; left: -9px; width: 20px; height: 20px; font-size: 8px; line-height: 1; cursor: grab; }
 .drag-handle:active { cursor: grabbing; }
 .drag-handle::after { content: "⋮⋮"; display: grid; place-items: center; width: 13px; height: 13px; border: 1px solid #ccc; border-radius: 2px; background: #fff; letter-spacing: -2px; padding-right: 2px; }
 .resize-handle { right: -8px; bottom: -8px; width: 18px; height: 18px; cursor: nwse-resize; }
 .resize-handle::after { content: "◢"; display: grid; place-items: center; width: 11px; height: 11px; border: 1px solid #ccc; border-radius: 1px; background: #fff; font-size: 7px; line-height: 1; }
-.note-card:hover .drag-handle, .note-card:hover .resize-handle, .note-card:focus-visible .drag-handle, .note-card:focus-visible .resize-handle, .note-card:focus-within .drag-handle, .note-card:focus-within .resize-handle, .note-card.is-moving .drag-handle, .note-card.is-resizing .resize-handle { opacity: 1; }
+.width-handle { right: -9px; top: 50%; width: 18px; height: 18px; transform: translateY(-50%); cursor: ew-resize; }
+.width-handle::after { content: "↔"; display: grid; place-items: center; width: 13px; height: 13px; border: 1px solid #ccc; border-radius: 2px; background: #fff; font-size: 10px; }
+.note-card:hover .drag-handle, .note-card:hover .resize-handle, .note-card:hover .width-handle, .note-card:focus-visible .drag-handle, .note-card:focus-visible .resize-handle, .note-card:focus-visible .width-handle, .note-card:focus-within .drag-handle, .note-card:focus-within .resize-handle, .note-card:focus-within .width-handle, .note-card.is-moving .drag-handle, .note-card.is-moving .resize-handle, .note-card.is-moving .width-handle { opacity: 1; }
 .overflow-area { display: flex; flex-direction: column; gap: 12px; width: min(794px,calc(100vw - 32px)); margin: 23px auto 0; padding: 16px 0 5px; border-top: 1px dashed #c7908a; }
 .overflow-heading { margin: 0; color: #a16e68; font-size: 11px; font-weight: 500; line-height: 1.5; }
 .overflow-area .note-card { position: relative !important; left: auto !important; top: auto !important; right: auto !important; bottom: auto !important; width: var(--overflow-note-width,100%) !important; height: var(--overflow-note-height,auto) !important; min-height: 0; transform: none !important; touch-action: auto; }
@@ -174,16 +175,16 @@ body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webki
   .paper-wrap { height: var(--mobile-viewport-height,calc(100vh - 142px)); height: var(--mobile-viewport-height,calc(100dvh - 142px)); min-height: 160px; padding: 2px 2px 16px; overflow: auto; }
   .edit-mode { height: var(--mobile-editor-height,100vh); height: var(--mobile-editor-height,100dvh); min-height: 0; padding: 0 max(12px,env(safe-area-inset-right)) env(safe-area-inset-bottom) max(12px,env(safe-area-inset-left)); overflow: hidden; }
   .editor-panel { height: 100%; min-height: 0; padding: 0; }
-  .editor-toolbar { flex: 0 0 auto; gap: 6px; margin: 0; min-height: 54px; padding-top: env(safe-area-inset-top); border-bottom: 1px solid #eee; }
+  .editor-toolbar { flex: 0 0 auto; flex-wrap: wrap; gap: 2px 4px; margin: 0; min-height: 54px; padding-top: env(safe-area-inset-top); border-bottom: 1px solid #eee; }
   .editor-toolbar .button { min-height: 44px; padding: 8px 10px; font-size: 14px; }
   .editor-toolbar .button-back { padding-left: 4px; }
-  .editor-status { max-width: 88px; font-size: 10px; }
+  .editor-status { flex-basis: 100%; max-width: none; min-height: 12px; padding-bottom: 4px; font-size: 10px; }
   .editor-content { flex: 1 1 auto; min-height: 0; resize: none; padding: 14px 2px 16px; font-size: 16px; line-height: 1.65; overflow-y: auto; -webkit-overflow-scrolling: touch; }
   .editor-footer { flex: 0 0 auto; align-items: center; flex-direction: row; gap: 8px; padding: 6px 0; }
   .editor-capacity { flex: 1 1 auto; max-width: 50%; }
   .editor-actions { flex: 0 0 auto; width: auto; justify-content: flex-end; }
   .editor-actions .button { min-height: 40px; padding-inline: 7px; font-size: 11px; }
-  body.is-editing .topbar, body.is-editing .privacy-note, body.is-editing .touch-note-tools, body:has(#editMode:not([hidden])) .topbar, body:has(#editMode:not([hidden])) .privacy-note, body:has(#editMode:not([hidden])) .touch-note-tools { display: none; }
+  body.is-editing .topbar, body.is-editing .privacy-note, body.is-editing .touch-note-handles, body:has(#editMode:not([hidden])) .topbar, body:has(#editMode:not([hidden])) .privacy-note, body:has(#editMode:not([hidden])) .touch-note-handles { display: none; }
   body.is-editing .app-shell, body:has(#editMode:not([hidden])) .app-shell { min-height: 0; height: var(--mobile-editor-height,100dvh); }
   body.is-editing .main-content, body:has(#editMode:not([hidden])) .main-content { min-height: 0; }
   .access-dialog { padding: 22px 19px; }
@@ -192,6 +193,6 @@ body.is-touch-device .paper-wrap { touch-action: none; user-select: none; -webki
   .privacy-note { padding-bottom: max(8px,env(safe-area-inset-bottom)); }
 }
 @media (pointer: coarse) {
-  .note-card .drag-handle, .note-card .resize-handle { display: none; }
+  .note-card .drag-handle, .note-card .resize-handle, .note-card .width-handle { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .button, .toast { transition: none; } }

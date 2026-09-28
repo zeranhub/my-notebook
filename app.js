@@ -8,8 +8,9 @@
   const ui = {
     pageTabs: $("pageTabs"), addPageButton: $("addPageButton"), renamePageButton: $("renamePageButton"),
     newNoteButton: $("newNoteButton"), canvasViewport: $("canvasViewport"), canvas: $("canvas"),
-    paperViewport: $("paperViewport"), touchNoteTools: $("touchNoteTools"),
-    touchEditButton: $("touchEditButton"), touchMoveButton: $("touchMoveButton"), touchResizeButton: $("touchResizeButton"),
+    paperViewport: $("paperViewport"), touchNoteHandles: $("touchNoteHandles"),
+    touchWidthHandle: $("touchWidthHandle"), touchScaleHandle: $("touchScaleHandle"),
+    undoButton: $("undoButton"), redoButton: $("redoButton"), editorUndoButton: $("editorUndoButton"), editorRedoButton: $("editorRedoButton"),
     addImageButton: $("addImageButton"), insertImageButton: $("insertImageButton"), imageFile: $("imageFile"), zoomSelect: $("zoomSelect"),
     overflowBadge: $("overflowBadge"), overflowArea: $("overflowArea"), viewCapacityLabel: $("viewCapacityLabel"),
     viewMode: $("viewMode"), editMode: $("editMode"), backButton: $("backButton"),
@@ -80,6 +81,13 @@
   let activeMoveCleanup = null;
   let paperGesture = null;
   let deferredView = false;
+  let longPressTimer = null;
+  let navigationId = crypto.randomUUID();
+  let navigationBackPending = false;
+  const journal = new window.OnePageHistory();
+  let historyBefore = null;
+  let historySelectionBefore = null;
+  let applyingHistory = false;
   const paperPointers = new Map();
   const pageViews = new Map();
   const assetUrls = new Map();
@@ -333,37 +341,85 @@
   }
 
   function measureBaseSize(width, text) {
-    const roundedWidth = Math.max(8, Math.round(width * 64) / 64);
+    // Chromium lays out on a 1/64 px grid. Measure the width that actually
+    // fits the requested frame; the resulting ink/frame bounds round outward.
+    const outward = value => Math.ceil((value - 1e-8) * 64) / 64;
+    const roundedWidth = Math.max(8, Math.floor((width + 1e-8) * 64) / 64);
+    measurementContent.style.width = "";
+    measurementContent.style.height = "auto";
+    measurementContent.style.transform = "none";
+    measurementContent.classList.remove("is-image-only");
+    const css = getComputedStyle(measurementContent);
+    const cacheKey = `${roundedWidth}:${css.font}:${css.lineHeight}:${css.padding}`;
     let sizes = measurementCache.get(text);
-    if (sizes?.has(roundedWidth)) return sizes.get(roundedWidth);
+    if (sizes?.has(cacheKey)) return sizes.get(cacheKey);
     measurement.style.width = `${roundedWidth}px`;
     measurement.style.height = "auto";
     renderBody(measurementContent, text || " ");
     let tightWidth = roundedWidth;
-    // Text ranges exclude the unused right side of a short paragraph. Visible
-    // block backgrounds, tables and images still reserve their complete width.
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const metrics = () => {
       const box = measurement.getBoundingClientRect();
       const contentBox = measurementContent.getBoundingClientRect();
-      const padding = parseFloat(getComputedStyle(measurementContent).paddingRight);
-      let right = contentBox.left + padding;
+      const style = getComputedStyle(measurementContent);
+      const paddingLeft = parseFloat(style.paddingLeft) || 0;
+      const paddingRight = parseFloat(style.paddingRight) || 0;
+      const paddingBottom = parseFloat(style.paddingBottom) || 0;
+      let right = contentBox.left + paddingLeft;
+      let bottom = contentBox.top;
+      let textRects = 0;
       const walker = document.createTreeWalker(measurementContent, NodeFilter.SHOW_TEXT);
       const range = document.createRange();
       while (walker.nextNode()) {
+        // A loading label is UI, not image content. Its glyphs must not change
+        // the immutable image ratio or the dimensions after the image loads.
+        if (walker.currentNode.parentElement?.closest(".md-image")) continue;
         range.selectNodeContents(walker.currentNode);
-        for (const rect of range.getClientRects()) if (rect.height > 0) right = Math.max(right, rect.right);
+        for (const rect of range.getClientRects()) {
+          if (rect.height <= 0 || rect.width <= 0) continue;
+          right = Math.max(right, rect.right);
+          bottom = Math.max(bottom, rect.bottom);
+          textRects++;
+        }
       }
-      for (const block of measurementContent.querySelectorAll("pre,table,.md-image,blockquote,hr,input,code")) {
-        right = Math.max(right, block.getBoundingClientRect().right);
+      const blocks = measurementContent.querySelectorAll("pre,table,.md-image,blockquote,hr");
+      for (const block of [...blocks, ...measurementContent.querySelectorAll("input,code")]) {
+        const rect = block.getBoundingClientRect();
+        right = Math.max(right, rect.right);
+        bottom = Math.max(bottom, rect.bottom);
       }
-      const nextWidth = Math.min(tightWidth, Math.max(8,
-        Math.ceil((right - box.left + padding + 1) * 64) / 64));
-      if (tightWidth - nextWidth < 1 / 64) break;
+      const borderWidth = box.width - contentBox.width;
+      // Filled blocks reserve their own width. Prose gets only a tiny glyph
+      // allowance after the CSS padding, rather than unused paragraph width.
+      const rightGuard = textRects && !blocks.length ? 0.125 : 0;
+      return {
+        width: Math.max(8, outward(right - contentBox.left + paddingRight + borderWidth + rightGuard)),
+        height: outward(Math.max(box.height,
+          bottom - contentBox.top + paddingBottom + (box.height - contentBox.height)) + (textRects ? 0.125 : 0))
+      };
+    };
+    // Remeasure after every width change. This also grows an impossibly narrow
+    // request enough to contain one Chinese glyph or an unbreakable emoji.
+    let mayShrink = true;
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const nextWidth = metrics().width;
+      if (Math.abs(tightWidth - nextWidth) < 1 / 64) break;
+      // Once a glyph needs more room, never shrink back to the earlier wrap
+      // in this pass. That shrink/grow cycle can otherwise leave a cached
+      // narrow width with the height of a different line arrangement.
+      if (nextWidth > tightWidth) mayShrink = false;
+      else if (!mayShrink) break;
       tightWidth = nextWidth;
       measurement.style.width = `${tightWidth}px`;
     }
-    const height = measurement.getBoundingClientRect().height;
-    const size = { w: tightWidth, h: height };
+    // Height is read only at the final width and includes actual font Range
+    // bounds, which may protrude below the CSS line box on the final line.
+    let finalMetrics = metrics();
+    if (finalMetrics.width > tightWidth) {
+      tightWidth = finalMetrics.width;
+      measurement.style.width = `${tightWidth}px`;
+      finalMetrics = metrics();
+    }
+    const size = { w: measurement.getBoundingClientRect().width, h: finalMetrics.height };
     measurementContent.replaceChildren();
     if (!sizes) {
       if (measurementCache.size >= 64) measurementCache.delete(measurementCache.keys().next().value);
@@ -371,19 +427,35 @@
       measurementCache.set(text, sizes);
     }
     if (sizes.size >= 160) sizes.delete(sizes.keys().next().value);
-    sizes.set(roundedWidth, size);
-    sizes.set(tightWidth, size);
+    // Do not alias the resulting width: that width has its own render and may
+    // have a different line break after another size/scale round trip.
+    sizes.set(cacheKey, size);
     return size;
   }
 
   function contentSize(width, text, scale = 1) {
-    const base = measureBaseSize(2 + Math.max(6, (width - 2) / scale), text);
-    return { w: 2 + (base.w - 2) * scale, h: 2 + (base.h - 2) * scale,
-      contentWidth: base.w - 2, contentHeight: base.h - 2, contentScale: scale };
+    const outward = value => Math.ceil((value - 1e-8) * 64) / 64;
+    let baseWidth = 2 + Math.max(6, (width - 2) / scale);
+    let size;
+    // The displayed frame is also quantized by layout. Resolve that width
+    // through the base measurement before saving it, so reading the saved
+    // width back does not cross a wrap threshold at a fractional scale.
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const base = measureBaseSize(baseWidth, text);
+      const next = { w: outward(2 + (base.w - 2) * scale), h: outward(2 + (base.h - 2) * scale),
+        contentWidth: base.w - 2, contentHeight: base.h - 2, contentScale: scale };
+      if (size && next.w === size.w && next.h === size.h) return next;
+      size = next;
+      baseWidth = 2 + Math.max(6, (next.w - 2) / scale);
+    }
+    return size;
   }
 
   function styleCardContent(content, size) {
     content.style.width = `${size.contentWidth}px`;
+    content.style.height = `${size.contentHeight}px`;
+    content.style.minHeight = "0";
+    content.style.boxSizing = "border-box";
     content.style.transformOrigin = "top left";
     content.style.transform = `scale(${size.contentScale})`;
   }
@@ -539,7 +611,7 @@
   }
 
   function selectNote(id) {
-    selectedNoteId = id;
+    selectedNoteId = touchDevice ? id : null;
     updateTouchSelection();
   }
 
@@ -550,27 +622,26 @@
       card.classList.toggle("is-selected", card.dataset.noteId === selectedNoteId);
       card.setAttribute("aria-pressed", String(card.dataset.noteId === selectedNoteId));
     }
-    ui.touchNoteTools.hidden = !touchDevice || !selectedNoteId;
+    ui.touchNoteHandles.hidden = !touchDevice || !selectedNoteId;
     const onPaper = lastLayout.placed.some(rect => rect.id === selectedNoteId);
-    ui.touchMoveButton.disabled = ui.touchResizeButton.disabled = !onPaper;
+    ui.touchWidthHandle.disabled = ui.touchScaleHandle.disabled = !onPaper;
     positionTouchTools();
   }
 
   function positionTouchTools() {
-    if (ui.touchNoteTools.hidden || activeMoveCleanup) return;
-    const card = [...ui.viewMode.querySelectorAll(".note-card")].find(item => item.dataset.noteId === selectedNoteId);
-    if (!card) return;
+    if (ui.touchNoteHandles.hidden) return;
+    const card = [...ui.canvas.querySelectorAll(".note-card")].find(item => item.dataset.noteId === selectedNoteId);
+    if (!card) { ui.touchNoteHandles.hidden = true; return; }
     const box = card.getBoundingClientRect();
     const viewport = ui.paperViewport.getBoundingClientRect();
-    const tools = ui.touchNoteTools.getBoundingClientRect();
-    const visibleBottom = Math.min(viewport.bottom, window.innerHeight) - 8;
-    const visibleTop = Math.max(8, viewport.top + 8);
-    let top = box.bottom + 8;
-    if (top + tools.height > visibleBottom) top = box.top - tools.height - 8;
-    ui.touchNoteTools.style.top = `${Math.max(visibleTop, Math.min(visibleBottom - tools.height, top))}px`;
-    ui.touchNoteTools.style.bottom = "auto";
-    ui.touchNoteTools.style.left = `${Math.max(tools.width / 2 + 10,
-      Math.min(window.innerWidth - tools.width / 2 - 10, box.left + box.width / 2))}px`;
+    const widthY = box.top + box.height / 2;
+    const scaleY = Math.max(box.bottom, widthY + 34);
+    for (const [button, y] of [[ui.touchWidthHandle, widthY], [ui.touchScaleHandle, scaleY]]) {
+      button.hidden = box.right < viewport.left || box.right > viewport.right ||
+        y < Math.max(0, viewport.top) || y > Math.min(window.innerHeight, viewport.bottom);
+      button.style.left = `${Math.min(window.innerWidth - 23, Math.max(23, box.right))}px`;
+      button.style.top = `${y}px`;
+    }
   }
 
   function tapNote(id) {
@@ -584,7 +655,19 @@
     if (paperPointers.size === 1) {
       paperGesture = { target: event.target, down: event, startX: event.clientX, startY: event.clientY,
         left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: false, pinched: false };
+      const card = event.target.closest(".note-card");
+      if (card) longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        if (!paperGesture || paperGesture.moved || paperGesture.pinched || paperPointers.size !== 1) return;
+        const note = byId(card.dataset.noteId);
+        if (!note) return;
+        selectNote(note.id);
+        paperPointers.clear();
+        paperGesture = null;
+        beginMove(event, note, card, "drag");
+      }, 420);
     } else if (paperPointers.size === 2) {
+      clearTimeout(longPressTimer); longPressTimer = null;
       const [a, b] = [...paperPointers.values()];
       paperGesture.pinched = true;
       paperGesture.scale = currentScale;
@@ -607,15 +690,9 @@
     } else if (paperPointers.size === 1) {
       const dx = event.clientX - paperGesture.startX;
       const dy = event.clientY - paperGesture.startY;
-      if (Math.hypot(dx, dy) > 6) paperGesture.moved = true;
-      const card = paperGesture.target.closest(".note-card");
-      if (paperGesture.moved && !paperGesture.pinched && card?.dataset.noteId === selectedNoteId) {
-        const down = paperGesture.down;
-        const note = byId(selectedNoteId);
-        paperPointers.clear();
-        paperGesture = null;
-        if (note) beginMove(down, note, card, "drag", event);
-        return;
+      if (Math.hypot(dx, dy) > 6) {
+        paperGesture.moved = true;
+        clearTimeout(longPressTimer); longPressTimer = null;
       }
       if (paperGesture.moved || paperGesture.pinched) {
         ui.paperViewport.scrollLeft = paperGesture.left - dx;
@@ -628,6 +705,7 @@
   function endPaperGesture(event) {
     if (!paperPointers.has(event.pointerId) || !paperGesture) return;
     const gesture = paperGesture;
+    clearTimeout(longPressTimer); longPressTimer = null;
     paperPointers.delete(event.pointerId);
     if (ui.paperViewport.hasPointerCapture(event.pointerId)) ui.paperViewport.releasePointerCapture(event.pointerId);
     if (paperPointers.size) {
@@ -689,6 +767,14 @@
     frame.append(content);
     card.append(frame);
     if (!overflow) {
+      const width = document.createElement("button");
+      width.type = "button";
+      width.className = "width-handle";
+      width.setAttribute("aria-label", "调整横向宽度并重新换行");
+      width.title = "调整宽度，字号不变";
+      width.addEventListener("pointerdown", event => beginMove(event, note, card, "width"));
+      width.addEventListener("click", event => event.stopPropagation());
+      card.append(width);
       const resize = document.createElement("button");
       resize.type = "button";
       resize.className = "resize-handle";
@@ -787,6 +873,7 @@
     updateMobileViewport();
     if (mode === "view") renderView();
     else { renderTabs(); renderEdit(); }
+    updateHistoryButtons();
   }
 
   function selectPage(id) {
@@ -798,9 +885,14 @@
     editingId = null;
     render();
     restorePageView(id);
+    replaceNavigationState();
   }
 
-  function enterEdit(id, isNew = false) {
+  function replaceNavigationState() {
+    window.history.replaceState({ onePage: { session: navigationId, mode, noteId: editingId, pageId: viewPageId } }, "", location.href);
+  }
+
+  function enterEdit(id, isNew = false, fromNavigation = false) {
     if (!unlocked) return;
     const note = byId(id);
     if (!note) return;
@@ -809,15 +901,25 @@
     viewPageId = note.pageId;
     editingId = id;
     editingWasNew = isNew;
+    selectedNoteId = touchDevice ? id : null;
     mode = "edit";
-    ui.touchNoteTools.hidden = true;
+    ui.touchNoteHandles.hidden = true;
+    if (!fromNavigation) window.history.pushState({ onePage: {
+      session: navigationId, mode: "edit", noteId: id, pageId: note.pageId
+    } }, "", location.href);
     render();
     ui.editorContent.focus({ preventScroll: touchDevice });
     ui.editorContent.setSelectionRange(ui.editorContent.value.length, ui.editorContent.value.length);
   }
 
-  function leaveEdit() {
+  function leaveEdit(fromNavigation = false) {
     if (!unlocked) return;
+    if (!fromNavigation && mode === "edit" && window.history.state?.onePage?.session === navigationId &&
+        window.history.state.onePage.mode === "edit") {
+      if (!navigationBackPending) { navigationBackPending = true; window.history.back(); }
+      return;
+    }
+    navigationBackPending = false;
     clearTimeout(layoutTimer);
     const note = byId(editingId);
     if (note && editingWasNew && note.content.length === 0) {
@@ -831,6 +933,7 @@
     mode = "view";
     render();
     restorePageView(viewPageId);
+    replaceNavigationState();
     requestAnimationFrame(() => window.scrollTo(returnScroll.x, returnScroll.y));
   }
 
@@ -848,6 +951,7 @@
     const moveScale = currentScale;
     const initialScale = noteScale(note);
     let candidateScale = initialScale;
+    let candidateSize = { ...placed };
     const content = card.querySelector(".note-card-content");
     let candidate = { ...start };
     let moved = false;
@@ -872,6 +976,25 @@
         x: edge(start.x + dx, margin, page.width - margin - start.w),
         y: edge(start.y + dy, margin, page.height - margin - start.h)
       };
+      else if (kind === "width") {
+        const targetWidth = Math.max(2 + 6 * initialScale,
+          Math.min(page.width - margin - start.x, start.w + dx));
+        const resized = value => contentSize(value, note.content, initialScale);
+        let size = resized(targetWidth);
+        if (!Layout.isValidRect({ ...start, w: size.w, h: size.h }, existing, page)) {
+          let valid = start.w, invalid = targetWidth;
+          for (let attempt = 0; attempt < 12; attempt++) {
+            const middle = (valid + invalid) / 2;
+            const measured = resized(middle);
+            if (Layout.isValidRect({ ...start, w: measured.w, h: measured.h }, existing, page)) {
+              valid = middle; size = measured;
+            } else invalid = middle;
+          }
+          if (valid === start.w) return;
+        }
+        next = { ...start, w: size.w, h: size.h };
+        candidateSize = size;
+      }
       else {
         const innerWidth = start.w - 2, innerHeight = start.h - 2;
         const factor = 1 + (dx * innerWidth + dy * innerHeight) / (innerWidth ** 2 + innerHeight ** 2);
@@ -910,6 +1033,8 @@
       card.style.width = `${next.w}px`;
       card.style.height = `${next.h}px`;
       if (kind === "resize") content.style.transform = `scale(${candidateScale})`;
+      else if (kind === "width") styleCardContent(content, candidateSize);
+      positionTouchTools();
     };
     const cleanup = () => {
       window.removeEventListener("pointermove", onMove);
@@ -923,7 +1048,7 @@
       if (up.pointerId !== event.pointerId) return;
       cleanup();
       if (!unlocked) return;
-      if (moved) suppressClickUntil = Date.now() + 350;
+      if (moved || event.pointerType === "touch") suppressClickUntil = Date.now() + 500;
       // A background sync can replace the document while the pointer is held.
       const currentNote = byId(note.id);
       if (up.type !== "pointercancel" && currentNote?.pageId === page.id && !equal(candidate, start)) {
@@ -993,8 +1118,72 @@
     if (unlocked) syncTimer = setTimeout(() => requestSync(false), delay);
   }
 
-  function changed() {
+  function historySnapshot() {
+    return { ...state, pages: state.pages.map(page => ({ ...page })),
+      notes: state.notes.map(note => ({ ...note })), assets: { ...state.assets } };
+  }
+
+  function historySelection() {
+    return { pageId: viewPageId, noteId: mode === "edit" ? editingId : selectedNoteId, mode,
+      start: mode === "edit" ? ui.editorContent.selectionStart : null,
+      end: mode === "edit" ? ui.editorContent.selectionEnd : null };
+  }
+
+  function rememberHistoryState() {
+    historyBefore = historySnapshot();
+    historySelectionBefore = historySelection();
+  }
+
+  function updateHistoryButtons() {
+    for (const button of [ui.undoButton, ui.editorUndoButton]) button.disabled = !unlocked || !journal.canUndo();
+    for (const button of [ui.redoButton, ui.editorRedoButton]) button.disabled = !unlocked || !journal.canRedo();
+  }
+
+  function applyHistory(direction) {
+    if (!unlocked || activeMoveCleanup || paperGesture || imageBusy) return;
+    clearTimeout(layoutTimer);
+    const result = journal[direction](state);
+    if (!result.applied) {
+      updateHistoryButtons();
+      if (result.conflicts) toast("这一步已被其他设备更新，已保留当前内容。");
+      return;
+    }
+    const previousNotes = new Map(state.notes.map(note => [note.id, note]));
+    state = parseData(result.data).data;
+    for (const note of state.notes) if (!equal(previousNotes.get(note.id), note)) note.updatedAt = now();
+    const selection = result.selection || {};
+    if (mode === "edit" && !byId(editingId)) {
+      editingId = null; editingWasNew = false; mode = "view"; ui.editorContent.blur();
+    }
+    if (mode === "edit") {
+      viewPageId = byId(editingId).pageId;
+      selectedNoteId = touchDevice ? editingId : null;
+    } else {
+      if (pageById(selection.pageId)) viewPageId = selection.pageId;
+      selectedNoteId = touchDevice ? byId(selection.noteId)?.id || null : null;
+    }
+    applyingHistory = true;
+    changed();
+    applyingHistory = false;
+    render();
+    if (mode === "edit") {
+      const start = Math.min(ui.editorContent.value.length, selection.start ?? ui.editorContent.value.length);
+      const end = Math.min(ui.editorContent.value.length, selection.end ?? start);
+      ui.editorContent.setSelectionRange(start, end);
+    }
+    rememberHistoryState();
+    if (mode === "view" && window.history.state?.onePage?.mode === "edit") window.history.back();
+    else replaceNavigationState();
+    if (result.conflicts) toast("已撤销可恢复的部分；其他设备的新修改已保留。");
+  }
+
+  function changed(group = null) {
     if (!unlocked) return;
+    if (!applyingHistory && historyBefore) journal.capture(historyBefore, state, {
+      group, selectionBefore: historySelectionBefore, selectionAfter: historySelection()
+    });
+    rememberHistoryState();
+    updateHistoryButtons();
     measurementCache.clear();
     changeNumber++;
     setStatus("pending", "正在保存加密草稿…");
@@ -1030,6 +1219,7 @@
     ensurePage();
     setDocumentReady(true);
     render();
+    rememberHistoryState();
     if (merged.conflicts) toast(`${merged.conflicts} 处同时修改已保留为独立笔记，请检查冲突标记。`);
     if (isDirty()) {
       changeNumber++;
@@ -1125,6 +1315,7 @@
       ui.addImageButton, ui.insertImageButton, ui.zoomSelect]) {
       item.disabled = !allow;
     }
+    updateHistoryButtons();
   }
 
   function setDocumentReady(ready) {
@@ -1155,6 +1346,8 @@
     }
     session++;
     unlocked = false;
+    journal.reset(); historyBefore = historySelectionBefore = null;
+    clearTimeout(longPressTimer); longPressTimer = null;
     activeMoveCleanup?.();
     paperPointers.clear();
     paperGesture = null;
@@ -1162,7 +1355,7 @@
     selectedNoteId = null;
     pageViews.clear();
     zoom = "fit";
-    ui.touchNoteTools.hidden = true;
+    ui.touchNoteHandles.hidden = true;
     document.body.classList.remove("is-editing");
     imageBusy = false;
     imageTarget = null;
@@ -1281,6 +1474,8 @@
     session++;
     const epoch = session;
     unlocked = true;
+    journal.reset(); historyBefore = historySelectionBefore = null;
+    navigationId = crypto.randomUUID(); navigationBackPending = false;
     remoteReady = false;
     clearAssetUrls();
     setDocumentReady(false);
@@ -1322,6 +1517,9 @@
       if (isDirty()) requestSync(false);
     }
     startPolling();
+    rememberHistoryState();
+    replaceNavigationState();
+    updateHistoryButtons();
   }
 
   ui.accessDialog.addEventListener("cancel", event => event.preventDefault());
@@ -1388,8 +1586,8 @@
   ui.paperViewport.addEventListener("pointermove", movePaperGesture, { passive: false });
   ui.paperViewport.addEventListener("pointerup", endPaperGesture);
   ui.paperViewport.addEventListener("pointercancel", endPaperGesture);
-  ui.touchEditButton.addEventListener("click", () => { if (selectedNoteId) enterEdit(selectedNoteId); });
-  for (const [button, kind] of [[ui.touchMoveButton, "drag"], [ui.touchResizeButton, "resize"]]) {
+  ui.paperViewport.addEventListener("contextmenu", event => { if (touchDevice && unlocked) event.preventDefault(); });
+  for (const [button, kind] of [[ui.touchWidthHandle, "width"], [ui.touchScaleHandle, "resize"]]) {
     button.addEventListener("pointerdown", event => {
       const note = byId(selectedNoteId);
       const card = [...ui.canvas.children].find(item => item.dataset.noteId === selectedNoteId);
@@ -1397,6 +1595,8 @@
     });
     button.addEventListener("click", event => event.preventDefault());
   }
+  for (const button of [ui.undoButton, ui.editorUndoButton]) button.addEventListener("click", () => applyHistory("undo"));
+  for (const button of [ui.redoButton, ui.editorRedoButton]) button.addEventListener("click", () => applyHistory("redo"));
   ui.addImageButton.addEventListener("click", () => chooseImage(true));
   ui.insertImageButton.addEventListener("click", () => chooseImage(false));
   ui.imageFile.addEventListener("change", () => {
@@ -1442,6 +1642,7 @@
     changed();
     render();
     restorePageView(page.id);
+    replaceNavigationState();
   });
   ui.renamePageButton.addEventListener("click", () => {
     if (!unlocked) return;
@@ -1465,14 +1666,14 @@
     changed();
     enterEdit(note.id, true);
   });
-  ui.backButton.addEventListener("click", leaveEdit);
+  ui.backButton.addEventListener("click", () => leaveEdit());
   ui.editorContent.addEventListener("input", () => {
     if (!unlocked || mode !== "edit") return;
     const note = byId(editingId);
     if (!note) return;
     note.content = ui.editorContent.value;
     note.updatedAt = now();
-    changed();
+    changed(`typing:${note.id}`);
     clearTimeout(layoutTimer);
     layoutTimer = setTimeout(renderEdit, 180);
   });
@@ -1495,7 +1696,7 @@
   ui.deleteButton.addEventListener("click", () => {
     if (!unlocked || mode !== "edit") return;
     const note = byId(editingId);
-    if (!note || !confirm("确定删除这篇笔记吗？删除后无法撤销。")) return;
+    if (!note) return;
     state.notes = state.notes.filter(item => item.id !== note.id);
     editingId = null;
     editingWasNew = false;
@@ -1505,8 +1706,10 @@
     changed();
     render();
     restorePageView(viewPageId);
+    if (window.history.state?.onePage?.mode === "edit") window.history.back();
+    else replaceNavigationState();
     requestAnimationFrame(() => window.scrollTo(returnScroll.x, returnScroll.y));
-    toast("笔记已删除。" );
+    toast("笔记已删除，可撤销。" );
   });
 
   function bytesToBase64(bytes) {
@@ -1601,6 +1804,27 @@
   window.addEventListener("focus", () => { if (unlocked) requestSync(true); });
   document.addEventListener("visibilitychange", () => {
     if (unlocked && document.visibilityState === "visible") requestSync(true);
+  });
+  window.addEventListener("popstate", event => {
+    navigationBackPending = false;
+    if (!unlocked) return;
+    const destination = event.state?.onePage;
+    if (destination?.session === navigationId && destination.mode === "edit" && byId(destination.noteId)) {
+      if (mode === "view") enterEdit(destination.noteId, false, true);
+    } else {
+      if (mode === "edit") leaveEdit(true);
+      if (destination?.session === navigationId && pageById(destination.pageId) && destination.pageId !== viewPageId) {
+        selectPage(destination.pageId);
+      }
+      replaceNavigationState();
+    }
+  });
+  document.addEventListener("keydown", event => {
+    if (!unlocked || ui.accessDialog.open || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+    if (event.key.toLowerCase() === "z" || (event.ctrlKey && event.key.toLowerCase() === "y")) {
+      event.preventDefault();
+      applyHistory(event.shiftKey || event.key.toLowerCase() === "y" ? "redo" : "undo");
+    }
   });
   function resizeViewport() {
     updateMobileViewport();
