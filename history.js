@@ -6,7 +6,7 @@
   const NOTE_FIELDS = ["pageId", "content", "contentScale", "layer", "x", "y", "w", "h",
     "manualSize", "manualPosition", "conflictOf", "legacyTags"];
   const PAPER_SIZE_FIELDS = ["width", "height", "paperWidthMm", "paperHeightMm", "paperPreset"];
-  const PAGE_FIELDS = ["name", "paperSize", "paperColor", "conflictOf"];
+  const PAGE_FIELDS = ["name", "paperSize", "paperColor", "paperPattern", "conflictOf"];
   const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
   const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
   const equal = (a, b) => a === b || JSON.stringify(a) === JSON.stringify(b);
@@ -14,6 +14,7 @@
   const scale = value => Number.isFinite(value) && value >= 0.25 && value <= 8 ? value : 1;
 
   function valueAt(item, field) {
+    if (field === "paperPattern") return { present: true, value: item?.paperPattern ?? "none" };
     if (field === "paperSize") return { present: true, value: Object.fromEntries(
       PAPER_SIZE_FIELDS.map(key => [key, { present: own(item, key), value: clone(item?.[key]) }])) };
     if (field === "contentScale") return { present: true, value: scale(item?.contentScale) };

@@ -275,7 +275,7 @@
     if (!item) return null;
     return kind === "page"
       ? JSON.stringify([item.name, item.width, item.height, item.paperWidthMm, item.paperHeightMm,
-        item.paperPreset, item.paperColor, item.conflictOf ?? null])
+        item.paperPreset, item.paperColor, item.paperPattern, item.conflictOf ?? null])
       : JSON.stringify([item.pageId, item.content, item.contentScale, item.layer, item.x, item.y, item.w, item.h,
         item.manualSize, item.manualPosition, item.conflictOf ?? null, item.legacyTags ?? null]);
   }
@@ -285,7 +285,7 @@
     const result = clone(remote);
     // A paper's dimensions, physical size and format always travel together.
     // Colour and name can merge independently from a format change.
-    const groups = [["name"], [...Paper.sizeFields], ["paperColor"], ["conflictOf"]];
+    const groups = [["name"], [...Paper.sizeFields], ["paperColor"], ["paperPattern"], ["conflictOf"]];
     for (const fields of groups) {
       const value = item => JSON.stringify(fields.map(field => item[field] ?? null));
       const before = value(base), mine = value(local), theirs = value(remote);

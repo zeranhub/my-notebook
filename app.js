@@ -42,7 +42,7 @@
   const signature = value => JSON.stringify({
     assets: value.assets || {},
     pages: value.pages.map(p => [p.id, p.name, p.width, p.height, p.paperWidthMm, p.paperHeightMm,
-      p.paperPreset, p.paperColor, p.conflictOf || null]),
+      p.paperPreset, p.paperColor, p.paperPattern, p.conflictOf || null]),
     notes: value.notes.map(n => [n.id, n.pageId, n.content, n.x, n.y, n.w, n.h,
       n.manualSize, n.manualPosition, n.contentScale ?? 1, n.layer ?? 0, n.conflictOf || null, n.legacyTags || null])
   });
@@ -686,6 +686,7 @@
     ui.canvasViewport.style.setProperty("--paper-width", `${page.width}px`);
     ui.canvasViewport.style.setProperty("--paper-height", `${page.height}px`);
     ui.canvasViewport.style.setProperty("--paper-color", window.OnePagePaper.resolve(page).paperColor);
+    Object.assign(ui.canvas.style, window.OnePagePaper.backgroundStyle(page));
     ui.canvasViewport.style.setProperty("--scaled-page-width", `${Math.round(page.width * currentScale)}px`);
     ui.canvasViewport.style.setProperty("--scaled-page-height", `${Math.round(page.height * currentScale)}px`);
     const paperStyle = getComputedStyle(ui.paperViewport);
@@ -2229,7 +2230,7 @@
     if (viewPageId === id) zoom = "fit";
     changed(); render();
     if (mode === "view") { restorePageView(id); savePageView(); }
-    toast(lastLayout.overflow.length ? "纸张已更新；放不下的正文仍完整保留在纸张外。" : "纸张尺寸和底色已保存。");
+    toast(lastLayout.overflow.length ? "纸张已更新；放不下的正文仍完整保留在纸张外。" : "纸张设置已保存。");
   }
 
   async function restoreVersionPage(source, pageId, current = () => true) {

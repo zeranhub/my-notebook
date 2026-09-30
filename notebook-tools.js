@@ -153,7 +153,7 @@
     function paperSettings() {
       if (!ctx.unlocked() || !ctx.page()) return;
       const page = ctx.page(), Paper = window.OnePagePaper, initial = Paper.resolve(page);
-      const current = open("纸张尺寸与底色");
+      const current = open("纸张尺寸、底色与底纹");
       message("只设置这张纸。每张纸始终有固定边界；改变尺寸后，放不下的正文仍完整保留在纸张外。");
       const preset = field("纸张类型", node("select")); preset.id = "paperPresetSelect";
       for (const item of Paper.presets) {
@@ -184,9 +184,14 @@
       colorLabel.append(colorPreset); colorRow.append(colorLabel);
       const color = node("input"); color.type = "color"; color.id = "paperColorInput"; color.value = initial.paperColor;
       color.setAttribute("aria-label", "自选纸张底色"); colorRow.append(color);
+      const pattern = field("底纹", node("select")); pattern.id = "paperPatternSelect";
+      for (const item of Paper.patterns) {
+        const option = node("option", item.label); option.value = item.id; pattern.append(option);
+      }
+      pattern.value = initial.paperPattern;
       const preview = node("div", "", "paper-setting-preview"), sheet = node("div", "", "paper-preview-sheet"), caption = node("p", "", "paper-preview-caption");
       preview.append(sheet, caption); body.append(preview);
-      const status = message("尺寸与底色会自动保存，并随笔记同步。"), row = actions();
+      const status = message("尺寸、底色与淡底纹会自动保存，并随笔记同步。"), row = actions();
       const apply = button(row, "应用到这张纸", () => {
         if (!current()) return;
         try { ctx.applyPaperSettings(page.id, settings()); close(); }
@@ -195,7 +200,7 @@
       button(row, "取消", close, false, "paper-settings-cancel");
       function settings() {
         return Paper.createSettings({ preset: preset.value, orientation: orientation.value,
-          widthMm: Number(shortSide.value), heightMm: Number(longSide.value), color: color.value });
+          widthMm: Number(shortSide.value), heightMm: Number(longSide.value), color: color.value, pattern: pattern.value });
       }
       function update() {
         if (!current()) return;
@@ -204,21 +209,23 @@
         try {
           const next = settings(), factor = Math.min(180 / next.width, 190 / next.height);
           if (preset.value !== "custom") { shortSide.value = String(Math.min(next.paperWidthMm, next.paperHeightMm)); longSide.value = String(Math.max(next.paperWidthMm, next.paperHeightMm)); }
-          sheet.style.width = `${next.width * factor}px`; sheet.style.height = `${next.height * factor}px`; sheet.style.backgroundColor = next.paperColor;
+          sheet.style.width = `${next.width * factor}px`; sheet.style.height = `${next.height * factor}px`;
+          Object.assign(sheet.style, Paper.backgroundStyle(next, factor));
           const format = Paper.presets.find(item => item.id === next.paperPreset)?.label || "自定义";
           const mm = value => Number(value.toFixed(2));
-          caption.textContent = `${format} · ${next.width > next.height ? "横版" : "竖版"} · ${mm(next.paperWidthMm)} × ${mm(next.paperHeightMm)} 毫米`;
-          status.classList.remove("is-error"); status.textContent = "尺寸与底色会自动保存，并随笔记同步。"; apply.disabled = false;
+          const patternLabel = Paper.patterns.find(item => item.id === next.paperPattern)?.label || "无底纹";
+          caption.textContent = `${format} · ${next.width > next.height ? "横版" : "竖版"} · ${mm(next.paperWidthMm)} × ${mm(next.paperHeightMm)} 毫米 · ${patternLabel}`;
+          status.classList.remove("is-error"); status.textContent = "尺寸、底色与淡底纹会自动保存，并随笔记同步。"; apply.disabled = false;
         } catch (error) { status.classList.add("is-error"); status.textContent = error.message; apply.disabled = true; }
       }
-      for (const item of [preset, orientation, shortSide, longSide, color]) item.addEventListener("input", update);
+      for (const item of [preset, orientation, shortSide, longSide, color, pattern]) item.addEventListener("input", update);
       colorPreset.addEventListener("change", () => { if (colorPreset.value !== "custom") color.value = colorPreset.value; update(); });
       update();
     }
     function paperExport() {
       if (!ctx.unlocked()) return;
       const current = open("导出当前纸张");
-      message("保留这张纸的尺寸、方向、底色和实际排版，只包含纸张边界内的内容。越界笔记可先移动到另一张纸。导出文件包含私人内容，请妥善保存。");
+      message("保留这张纸的尺寸、方向、底色、底纹和实际排版，只包含纸张边界内的内容。越界笔记可先移动到另一张纸。导出文件包含私人内容，请妥善保存。");
       const status = message("文字、图片和重叠层次按当前纸面保留。"), row = actions();
       let busy = false;
       async function save(format) {

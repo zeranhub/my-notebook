@@ -29,7 +29,8 @@
     }
     const candidateColor = paper?.paperColor ?? page?.paperColor;
     const paperColor = /^#[0-9a-f]{6}$/i.test(candidateColor) ? candidateColor : "#ffffff";
-    return { width, height, paperWidthMm, paperHeightMm, paperColor };
+    const paperPattern = paper?.paperPattern ?? page?.paperPattern ?? "none";
+    return { width, height, paperWidthMm, paperHeightMm, paperColor, paperPattern };
   }
 
   function resolution(width, height, scale) {
@@ -111,7 +112,8 @@
   async function render({ canvas, page, scale = DEFAULT_SCALE, isCurrent } = {}) {
     assertCurrent(isCurrent);
     if (!(canvas instanceof Element) || !canvas.isConnected) throw new Error("请先打开要导出的纸张。");
-    const { width, height, paperColor } = dimensions(page);
+    const paper = dimensions(page);
+    const { width, height, paperColor } = paper;
     const { outputWidth, outputHeight } = resolution(width, height, scale);
     if (document.fonts?.ready) await document.fonts.ready;
     assertCurrent(isCurrent);
@@ -121,7 +123,14 @@
     }
     const copy = clonePaintedNode(canvas);
     Object.assign(copy.style, { position: "relative", inset: "auto", left: "auto", top: "auto", width: `${width}px`, height: `${height}px`,
-      margin: "0", transform: "none", transformOrigin: "top left", overflow: "hidden", background: paperColor, border: "0", outline: "none" });
+      margin: "0", transform: "none", transformOrigin: "top left", overflow: "hidden", border: "0", outline: "none" });
+    // Use the paper's own drawing definition. A background shorthand would
+    // erase its ruled/grid/dot layers; explicit properties also clear an old
+    // pattern when this paper is switched back to plain paper.
+    Object.assign(copy.style, window.OnePagePaper?.backgroundStyle(paper) || {
+      backgroundColor: paperColor, backgroundImage: "none", backgroundSize: "auto",
+      backgroundPosition: "0px 0px", backgroundRepeat: "repeat"
+    });
     copy.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
     const markup = new XMLSerializer().serializeToString(copy);
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"><foreignObject x="0" y="0" width="${width}" height="${height}">${markup}</foreignObject></svg>`;

@@ -28,6 +28,16 @@
     { id: "green", label: "浅绿", value: "#edf4ed" },
     { id: "blue", label: "浅蓝", value: "#edf3fa" }
   ].map(item => Object.freeze(item)));
+  const patterns = Object.freeze([
+    { id: "none", label: "无底纹" },
+    { id: "ruled", label: "横线" },
+    { id: "vertical", label: "竖线" },
+    { id: "grid", label: "方格" },
+    { id: "dots", label: "点阵" },
+    { id: "graph", label: "细网格" },
+    { id: "isometric", label: "等距网格" }
+  ].map(item => Object.freeze(item)));
+  const patternIds = new Set(patterns.map(item => item.id));
   const byId = new Map(presets.map(item => [item.id, item]));
 
   function invalid(code, message) {
@@ -40,6 +50,10 @@
       invalid("INVALID_PAPER_COLOR", "纸张底色须为有效的六位颜色值，例如 #f3ead3。");
     }
     return value.toLowerCase();
+  }
+  function pattern(value = "none") {
+    if (!patternIds.has(value)) invalid("INVALID_PAPER_PATTERN", "请选择有效的纸张底纹。");
+    return value;
   }
   function dimension(value, label) {
     if (typeof value !== "number" || !Number.isFinite(value) || value < MIN_PIXELS || value > MAX_PIXELS) {
@@ -83,7 +97,8 @@
     const inferred = requested && requested.kind !== "custom" && matches(requested, paperWidthMm, paperHeightMm)
       ? requested : presets.find(item => item.kind !== "custom" && matches(item, paperWidthMm, paperHeightMm));
     const paperPreset = page.paperPreset === "custom" ? "custom" : inferred?.id || "custom";
-    return { width, height, paperWidthMm, paperHeightMm, paperPreset, paperColor: color(page.paperColor) };
+    return { width, height, paperWidthMm, paperHeightMm, paperPreset,
+      paperColor: color(page.paperColor), paperPattern: pattern(page.paperPattern) };
   }
 
   function resolve(page = {}) {
@@ -92,7 +107,7 @@
   }
 
   function createSettings({ preset = "a4", orientation = "portrait", widthMm, heightMm,
-    color: selectedColor = "#ffffff" } = {}) {
+    color: selectedColor = "#ffffff", pattern: selectedPattern = "none" } = {}) {
     const format = byId.get(preset);
     if (!format) invalid("INVALID_PAPER_PRESET", "请选择有效的纸张类型。");
     if (!["portrait", "landscape"].includes(orientation)) {
@@ -104,10 +119,64 @@
     first = orientation === "landscape" ? large : small;
     second = orientation === "landscape" ? small : large;
     return normalize({ width: Math.round(first * PIXELS_PER_MM), height: Math.round(second * PIXELS_PER_MM),
-      paperWidthMm: first, paperHeightMm: second, paperPreset: preset, paperColor: selectedColor });
+      paperWidthMm: first, paperHeightMm: second, paperPreset: preset,
+      paperColor: selectedColor, paperPattern: selectedPattern });
   }
 
-  const api = Object.freeze({ presets, colors, resolve, normalize, createSettings,
+  function backgroundStyle(page, scale = 1) {
+    const settings = normalize(page);
+    if (typeof scale !== "number" || !Number.isFinite(scale) || scale <= 0 || scale > 100) {
+      invalid("INVALID_PAPER_SCALE", "底纹预览比例须为大于 0 且不超过 100 的有限数字。");
+    }
+    const style = { backgroundColor: settings.paperColor, backgroundImage: "none",
+      backgroundSize: "auto", backgroundPosition: "0px 0px", backgroundRepeat: "repeat" };
+    if (settings.paperPattern === "none") return style;
+    const channels = [1, 3, 5].map(start => parseInt(settings.paperColor.slice(start, start + 2), 16));
+    const luminance = (channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722) / 255;
+    const ink = luminance < 0.42 ? "255, 255, 255" : "38, 43, 48";
+    const regular = `rgba(${ink}, 0.09)`, fine = `rgba(${ink}, 0.045)`;
+    // All coordinates belong to the finite paper. Scaling is used only for
+    // previews; a transformed real canvas keeps these logical pixel values.
+    // Hard-edged subpixel gradients can disappear in Chromium at fit zoom.
+    // Keep a visible stroke in the miniature preview and soften it by colour.
+    const stroke = value => `${Number(Math.max(1, value * scale).toFixed(8))}px`;
+    const stripe = (angle, tone = regular, width = 1) =>
+      `linear-gradient(${angle}, ${tone} 0px, ${tone} ${stroke(width)}, transparent ${stroke(width)})`;
+    // A very large custom paper also needs a readable, non-solid preview.
+    const gap = spacing => `${Number(Math.max(3, spacing * scale).toFixed(8))}px`;
+    const tile = spacing => `${gap(spacing)} ${gap(spacing)}`;
+    switch (settings.paperPattern) {
+      case "ruled":
+        style.backgroundImage = stripe("to bottom"); style.backgroundSize = tile(24); break;
+      case "vertical":
+        style.backgroundImage = stripe("to right"); style.backgroundSize = tile(24); break;
+      case "grid":
+        style.backgroundImage = `${stripe("to right")}, ${stripe("to bottom")}`;
+        style.backgroundSize = `${tile(24)}, ${tile(24)}`; break;
+      case "dots":
+        {
+          const radius = Math.max(0.65, 0.8 * scale);
+          style.backgroundImage = `radial-gradient(circle, ${regular} 0px, ${regular} ${radius}px, transparent ${radius + 0.1 * scale}px)`;
+        }
+        style.backgroundSize = tile(20); break;
+      case "graph":
+        style.backgroundImage = [stripe("to right"), stripe("to bottom")].join(", ");
+        style.backgroundSize = `${tile(30)}, ${tile(30)}`;
+        // Tiny preview cells otherwise merge into a dark fill or moire.
+        if (6 * scale >= 3) {
+          style.backgroundImage += `, ${stripe("to right", fine)}, ${stripe("to bottom", fine)}`;
+          style.backgroundSize += `, ${tile(6)}, ${tile(6)}`;
+        }
+        break;
+      case "isometric":
+        style.backgroundImage = ["30deg", "90deg", "150deg"].map(angle =>
+          `repeating-linear-gradient(${angle}, ${regular} 0px, ${regular} ${stroke(1)}, transparent ${stroke(1)}, transparent ${gap(24)})`).join(", ");
+        break;
+    }
+    return style;
+  }
+
+  const api = Object.freeze({ presets, colors, patterns, resolve, normalize, createSettings, backgroundStyle,
     sizeFields: SIZE_FIELDS, minMm: MIN_MM, maxMm: MAX_MM, pixelsPerMm: PIXELS_PER_MM });
   if (typeof window !== "undefined") window.OnePagePaper = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
