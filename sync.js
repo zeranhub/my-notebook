@@ -9,6 +9,10 @@
  * setup(pin, token); unlock(pin); lock(); load(); save(notes, sha);
  * saveDraft(value); loadDraft(); clearDraft(); validateToken(token); forget().
  * uploadAsset(asset, Uint8Array | ArrayBuffer); loadAsset(asset) -> Uint8Array.
+ * listVersions({ page, perPage }); loadVersion(commitSha).
+ * saveVersionSnapshot(notes, { sha, label }); loadVersionSnapshots().
+ * Remote versions are successful notebook commits; local snapshots are
+ * encrypted, limited to 20 entries and approximately 4 MB on this device.
  * Asset metadata contains id, path, mime, width, height, name. The path must be
  * assets/<id>.<png|jpg|webp>; image bytes never receive a public download URL.
  * Draft methods round-trip any JSON value and keep it encrypted on this device.
@@ -25,6 +29,8 @@
   // GitHub's Contents API stops returning Base64 content for files above 1 MB.
   const MAX_CONTENT_BYTES = 1_000_000;
   const STORAGE_VERSION = 1;
+  const MAX_VERSION_SNAPSHOTS = 20;
+  const MAX_VERSION_STORAGE_BYTES = 4_000_000;
   const IMAGE_EXTENSIONS = Object.freeze({ "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" });
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -54,6 +60,13 @@
       throw syncError("INVALID_TOKEN", "请输入 GitHub 访问令牌。");
     }
     return token.trim();
+  }
+
+  function requireSha(value, label = "版本号") {
+    if (typeof value !== "string" || !/^[a-f0-9]{40}$/i.test(value)) {
+      throw syncError("INVALID_DATA", `${label}格式有误。`);
+    }
+    return value.toLowerCase();
   }
 
   function requireAsset(asset) {
@@ -145,10 +158,15 @@
     #key = null;
     #storageKey;
     #draftStorageKey;
+    #versionsStorageKey;
     #repoUrl;
     #contentUrl;
     #context;
     #draftContext;
+    #versionsContext;
+    #path;
+    #session = 0;
+    #snapshotQueue = Promise.resolve();
     #pendingRequests = new Set();
     #responseContexts = new WeakMap();
 
@@ -164,8 +182,11 @@
       this.#contentUrl = `${this.#repoUrl}/contents/${encodedPath}`;
       this.#storageKey = `notebook-sync:v1:${owner}/${repo}/${path}`;
       this.#draftStorageKey = `notebook-draft:v1:${owner}/${repo}/${path}`;
+      this.#versionsStorageKey = `notebook-versions:v1:${owner}/${repo}/${path}`;
       this.#context = encoder.encode(`${owner}/${repo}/${path}`);
       this.#draftContext = encoder.encode(`draft:${owner}/${repo}/${path}`);
+      this.#versionsContext = encoder.encode(`versions:${owner}/${repo}/${path}`);
+      this.#path = path;
     }
 
     isConfigured() {
@@ -177,6 +198,7 @@
     }
 
     async setup(pin, token) {
+      const session = this.#session;
       requireCrypto();
       requirePin(pin);
       const cleanToken = requireToken(token);
@@ -197,6 +219,7 @@
         iv: bytesToBase64(iv),
         ciphertext: bytesToBase64(ciphertext)
       };
+      this.#assertSession(session);
       try {
         localStorage.setItem(this.#storageKey, JSON.stringify(record));
       } catch {
@@ -207,6 +230,7 @@
     }
 
     async unlock(pin) {
+      const session = this.#session;
       requireCrypto();
       requirePin(pin);
       let raw;
@@ -239,9 +263,11 @@
           key,
           ciphertext
         );
+        this.#assertSession(session);
         this.#token = requireToken(decoder.decode(plaintext));
         this.#key = key;
-      } catch {
+      } catch (error) {
+        if (error.code === "LOCKED") throw error;
         this.#token = null;
         this.#key = null;
         throw syncError("UNLOCK_FAILED", "密码错误，或本地授权信息已损坏。");
@@ -249,13 +275,19 @@
     }
 
     lock() {
+      this.#session++;
       this.#token = null;
       this.#key = null;
       for (const controller of this.#pendingRequests) controller.abort();
       this.#pendingRequests.clear();
     }
 
+    #assertSession(session) {
+      if (session !== this.#session) throw syncError("LOCKED", "笔记已锁定，请重新解锁后操作。");
+    }
+
     async #fetch(url, token, options = {}) {
+      const session = this.#session;
       const controller = new AbortController();
       this.#pendingRequests.add(controller);
       const timer = setTimeout(() => controller.abort(), 30_000);
@@ -278,13 +310,17 @@
             ...options.headers
           }
         });
+        this.#assertSession(session);
         // Keep timeout/lock cancellation active while the JSON response body
         // is read, including servers that send headers then stall the body.
-        if (response.ok) this.#responseContexts.set(response, { controller, release });
+        if (response.ok) this.#responseContexts.set(response, { controller, release, session });
         else release();
         return response;
-      } catch {
+      } catch (error) {
         release();
+        if (session !== this.#session || error.code === "LOCKED") {
+          throw syncError("LOCKED", "笔记已锁定，请重新解锁后操作。");
+        }
         throw syncError("NETWORK_ERROR", "无法连接 GitHub，请检查网络后重试。");
       }
     }
@@ -297,8 +333,13 @@
     async #json(response) {
       const context = this.#responseContexts.get(response);
       try {
-        return await response.json();
-      } catch {
+        const value = await response.json();
+        if (context) this.#assertSession(context.session);
+        return value;
+      } catch (error) {
+        if ((context?.session !== undefined && context.session !== this.#session) || error.code === "LOCKED") {
+          throw syncError("LOCKED", "笔记已锁定，请重新解锁后操作。");
+        }
         if (context?.controller.signal.aborted) {
           throw syncError("NETWORK_ERROR", "GitHub 请求超时或已取消，请重试。");
         }
@@ -318,8 +359,10 @@
     }
 
     async validateToken(token) {
+      const session = this.#session;
       const cleanToken = requireToken(token);
       await this.#assertPrivateRepo(cleanToken);
+      this.#assertSession(session);
       const response = await this.#fetch(this.#contentUrl, cleanToken);
       // Deployment creates data/notes.json first. A 404 now means missing
       // Contents access or a broken deployment, so it must not pass validation.
@@ -334,27 +377,167 @@
     }
 
     async load() {
+      const session = this.#session;
       const token = this.#requireUnlocked();
       await this.#assertPrivateRepo(token);
+      this.#assertSession(session);
       const response = await this.#fetch(this.#contentUrl, token);
       if (!response.ok) throw httpError(response, "content");
       const file = await this.#json(response);
-      if (file.encoding === "none") {
+      return this.#decodeNotebookFile(file);
+    }
+
+    #decodeNotebookFile(file) {
+      if (file.encoding === "none" || typeof file.size === "number" && file.size > MAX_CONTENT_BYTES) {
         throw syncError("TOO_LARGE", "笔记文件超过 GitHub Contents API 的 1 MB 读取限制，请先从 GitHub 下载备份并精简内容。");
       }
       if (file.encoding !== "base64" || typeof file.content !== "string" ||
-          typeof file.sha !== "string") {
+          file.content.length > 1_400_000 || typeof file.sha !== "string") {
         throw syncError("INVALID_DATA", "笔记文件格式不受支持。");
       }
       try {
-        const notes = JSON.parse(decoder.decode(base64ToBytes(file.content)));
+        const bytes = base64ToBytes(file.content);
+        if (bytes.length > MAX_CONTENT_BYTES) throw syncError("TOO_LARGE", "笔记文件超过 1 MB，无法读取此版本。");
+        const notes = JSON.parse(decoder.decode(bytes));
         return { notes, sha: file.sha };
-      } catch {
+      } catch (error) {
+        if (error.code === "TOO_LARGE") throw error;
         throw syncError("INVALID_DATA", "笔记文件不是有效的 JSON，或文字编码有误。");
       }
     }
 
+    async listVersions({ page = 1, perPage = 20 } = {}) {
+      const session = this.#session;
+      const token = this.#requireUnlocked();
+      if (!Number.isInteger(page) || page < 1 || page > 10_000 ||
+          !Number.isInteger(perPage) || perPage < 1 || perPage > 100) {
+        throw syncError("INVALID_DATA", "历史版本页码或每页数量有误。");
+      }
+      await this.#assertPrivateRepo(token);
+      this.#assertSession(session);
+      const url = `${this.#repoUrl}/commits?path=${encodeURIComponent(this.#path)}&per_page=${perPage}&page=${page}`;
+      const response = await this.#fetch(url, token);
+      if (!response.ok) throw httpError(response);
+      const link = response.headers.get("link");
+      const commits = await this.#json(response);
+      if (!Array.isArray(commits) || commits.length > perPage) {
+        throw syncError("INVALID_RESPONSE", "GitHub 返回的历史版本列表格式有误。");
+      }
+      const versions = commits.map(item => {
+        let sha;
+        try { sha = requireSha(item?.sha, "历史提交号"); }
+        catch { throw syncError("INVALID_RESPONSE", "历史版本缺少有效提交号。"); }
+        const rawDate = item.commit?.committer?.date ?? item.commit?.author?.date;
+        const parsedDate = typeof rawDate === "string" ? Date.parse(rawDate) : NaN;
+        const author = item.commit?.author?.name ?? item.author?.login;
+        return {
+          sha,
+          date: Number.isFinite(parsedDate) ? new Date(parsedDate).toISOString() : null,
+          message: typeof item.commit?.message === "string" ? item.commit.message.split(/\r?\n/, 1)[0].slice(0, 240) : "笔记更新",
+          author: typeof author === "string" ? author.slice(0, 120) : ""
+        };
+      });
+      // Follow pagination by page number only, never a server-supplied URL.
+      const hasMore = link !== null ? /;\s*rel\s*=\s*"next"/i.test(link) : versions.length === perPage;
+      return { versions, page, perPage, hasMore, nextPage: hasMore ? page + 1 : null };
+    }
+
+    async loadVersion(commitSha) {
+      const session = this.#session;
+      const token = this.#requireUnlocked();
+      const versionSha = requireSha(commitSha, "历史提交号");
+      await this.#assertPrivateRepo(token);
+      this.#assertSession(session);
+      const response = await this.#fetch(`${this.#contentUrl}?ref=${versionSha}`, token);
+      if (!response.ok) throw httpError(response, "content");
+      const file = await this.#json(response);
+      return { ...this.#decodeNotebookFile(file), versionSha };
+    }
+
+    async #readVersionSnapshots(key, session) {
+      this.#assertSession(session);
+      let raw;
+      try { raw = localStorage.getItem(this.#versionsStorageKey); }
+      catch { throw syncError("STORAGE_UNAVAILABLE", "浏览器无法读取加密历史版本。"); }
+      if (raw === null) return [];
+      try {
+        if (raw.length > MAX_VERSION_STORAGE_BYTES) throw new Error("oversized history");
+        const record = JSON.parse(raw);
+        if (record.version !== STORAGE_VERSION) throw new Error("unsupported format");
+        const iv = base64ToBytes(record.iv);
+        const ciphertext = base64ToBytes(record.ciphertext);
+        if (iv.length !== 12 || ciphertext.length < 16) throw new Error("invalid history");
+        const plaintext = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv, additionalData: this.#versionsContext }, key, ciphertext
+        );
+        this.#assertSession(session);
+        const entries = JSON.parse(decoder.decode(plaintext));
+        if (!Array.isArray(entries) || entries.length > MAX_VERSION_SNAPSHOTS || entries.some(item =>
+          !item || typeof item !== "object" || typeof item.id !== "string" ||
+          !/^version-[a-f0-9]{32}$/.test(item.id) || typeof item.createdAt !== "string" ||
+          !Number.isFinite(Date.parse(item.createdAt)) || typeof item.label !== "string" || item.label.length > 120 ||
+          (item.sha !== null && (typeof item.sha !== "string" || !/^[a-f0-9]{40}$/i.test(item.sha))) ||
+          !Object.hasOwn(item, "notes"))) throw new Error("invalid history entries");
+        return entries;
+      } catch (error) {
+        if (error.code === "LOCKED") throw error;
+        throw syncError("VERSIONS_CORRUPT", "本机历史版本无法解密，可能已损坏或使用了旧密码；云端历史仍可查询。");
+      }
+    }
+
+    async loadVersionSnapshots() {
+      this.#requireUnlocked();
+      const session = this.#session;
+      const key = this.#key;
+      const pending = this.#snapshotQueue;
+      await pending;
+      this.#assertSession(session);
+      return this.#readVersionSnapshots(key, session);
+    }
+
+    async saveVersionSnapshot(notes, { sha = null, label = "" } = {}) {
+      this.#requireUnlocked();
+      const session = this.#session;
+      const key = this.#key;
+      if (sha !== null) sha = requireSha(sha);
+      if (typeof label !== "string" || label.length > 120) throw syncError("INVALID_DATA", "历史版本说明须不超过 120 字。");
+      let json;
+      try { json = JSON.stringify(notes); }
+      catch { throw syncError("INVALID_DATA", "历史笔记无法转换为 JSON。"); }
+      if (typeof json !== "string") throw syncError("INVALID_DATA", "历史笔记内容不能为空。");
+      if (encoder.encode(json).length > 2_900_000) throw syncError("TOO_LARGE", "笔记过大，无法保存本机历史版本，请导出备份。");
+      const operation = this.#snapshotQueue.then(async () => {
+        this.#assertSession(session);
+        const entries = await this.#readVersionSnapshots(key, session);
+        // Callers may snapshot before several actions. Repeating an unchanged
+        // document should not consume the device's limited history capacity.
+        if (entries[0] && JSON.stringify(entries[0].notes) === json) {
+          const { id, createdAt, sha: existingSha, label: existingLabel } = entries[0];
+          return { id, createdAt, sha: existingSha, label: existingLabel };
+        }
+        const idBytes = crypto.getRandomValues(new Uint8Array(16));
+        const id = `version-${Array.from(idBytes, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+        const entry = { id, createdAt: new Date().toISOString(), sha, label, notes: JSON.parse(json) };
+        entries.unshift(entry);
+        entries.length = Math.min(entries.length, MAX_VERSION_SNAPSHOTS);
+        while (entries.length > 1 && encoder.encode(JSON.stringify(entries)).length > 2_990_000) entries.pop();
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv, additionalData: this.#versionsContext }, key, encoder.encode(JSON.stringify(entries))
+        ));
+        this.#assertSession(session);
+        const record = JSON.stringify({ version: STORAGE_VERSION, iv: bytesToBase64(iv), ciphertext: bytesToBase64(ciphertext) });
+        if (record.length > MAX_VERSION_STORAGE_BYTES) throw syncError("TOO_LARGE", "本机历史版本超过容量，请导出备份。");
+        try { localStorage.setItem(this.#versionsStorageKey, record); }
+        catch { throw syncError("STORAGE_UNAVAILABLE", "浏览器无法保存加密历史版本，请检查本机存储空间。"); }
+        return { id, createdAt: entry.createdAt, sha, label };
+      });
+      this.#snapshotQueue = operation.catch(() => {});
+      return operation;
+    }
+
     async save(notes, sha) {
+      const session = this.#session;
       const token = this.#requireUnlocked();
       let json;
       try {
@@ -385,6 +568,7 @@
         throw syncError("INVALID_DATA", "笔记文件版本号格式有误。");
       }
       await this.#assertPrivateRepo(token);
+      this.#assertSession(session);
       const body = {
         message: "Update private notebook",
         content: bytesToBase64(contentBytes)
@@ -408,10 +592,12 @@
     }
 
     async uploadAsset(asset, value) {
+      const session = this.#session;
       const token = this.#requireUnlocked();
       const metadata = requireAsset(asset);
       const bytes = requireImageBytes(value, metadata.mime);
       await this.#assertPrivateRepo(token);
+      this.#assertSession(session);
       const response = await this.#fetch(this.#assetUrl(metadata), token, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -440,9 +626,11 @@
     }
 
     async loadAsset(asset) {
+      const session = this.#session;
       const token = this.#requireUnlocked();
       const metadata = requireAsset(asset);
       await this.#assertPrivateRepo(token);
+      this.#assertSession(session);
       const response = await this.#fetch(this.#assetUrl(metadata), token);
       if (!response.ok) throw httpError(response, "content");
       const file = await this.#json(response);
@@ -457,6 +645,8 @@
 
     async saveDraft(value) {
       if (!this.#key) throw syncError("LOCKED", "请先输入 6 位密码解锁。");
+      const session = this.#session;
+      const key = this.#key;
       let json;
       try {
         json = JSON.stringify(value);
@@ -467,7 +657,7 @@
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
         { name: "AES-GCM", iv, additionalData: this.#draftContext },
-        this.#key,
+        key,
         encoder.encode(json)
       ));
       const record = {
@@ -475,6 +665,7 @@
         iv: bytesToBase64(iv),
         ciphertext: bytesToBase64(ciphertext)
       };
+      this.#assertSession(session);
       try {
         localStorage.setItem(this.#draftStorageKey, JSON.stringify(record));
       } catch {
@@ -484,6 +675,8 @@
 
     async loadDraft() {
       if (!this.#key) throw syncError("LOCKED", "请先输入 6 位密码解锁。");
+      const session = this.#session;
+      const key = this.#key;
       let raw;
       try {
         raw = localStorage.getItem(this.#draftStorageKey);
@@ -499,11 +692,13 @@
         if (iv.length !== 12 || ciphertext.length < 16) throw new Error("invalid draft");
         const plaintext = await crypto.subtle.decrypt(
           { name: "AES-GCM", iv, additionalData: this.#draftContext },
-          this.#key,
+          key,
           ciphertext
         );
+        this.#assertSession(session);
         return JSON.parse(decoder.decode(plaintext));
-      } catch {
+      } catch (error) {
+        if (error.code === "LOCKED") throw error;
         throw syncError("DRAFT_CORRUPT", "本地草稿无法解密，可能已损坏或使用了旧密码。");
       }
     }
@@ -521,6 +716,7 @@
       try {
         localStorage.removeItem(this.#storageKey);
         localStorage.removeItem(this.#draftStorageKey);
+        localStorage.removeItem(this.#versionsStorageKey);
       } catch {
         throw syncError("STORAGE_UNAVAILABLE", "浏览器无法清除本地授权信息。");
       }

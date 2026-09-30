@@ -8,15 +8,18 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.github.com; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
   <title>一页纸</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='10' y='5' width='44' height='54' rx='2' fill='%23ffffff' stroke='%23333333' stroke-width='3'/%3E%3Cpath d='M20 23h24M20 33h21M20 43h16' stroke='%23333333' stroke-width='2'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="styles.css?v=20260929-paper-zoom">
-  <script src="sync.js?v=20260929-paper-zoom" defer></script>
-  <script src="layout.js?v=20260929-paper-zoom" defer></script>
-  <script src="model.js?v=20260929-paper-zoom" defer></script>
-  <script src="history.js?v=20260929-paper-zoom" defer></script>
-  <script src="vendor/marked.umd.js?v=20260929-paper-zoom" defer></script>
-  <script src="vendor/purify.min.js?v=20260929-paper-zoom" defer></script>
-  <script src="markdown.js?v=20260929-paper-zoom" defer></script>
-  <script src="app.js?v=20260929-paper-zoom" defer></script>
+  <link rel="stylesheet" href="styles.css?v=20260930-complete">
+  <script src="sync.js?v=20260930-complete" defer></script>
+  <script src="layout.js?v=20260930-complete" defer></script>
+  <script src="model.js?v=20260930-complete" defer></script>
+  <script src="history.js?v=20260930-complete" defer></script>
+  <script src="vendor/marked.umd.js?v=20260930-complete" defer></script>
+  <script src="vendor/purify.min.js?v=20260930-complete" defer></script>
+  <script src="markdown.js?v=20260930-complete" defer></script>
+  <script src="notebook-search.js?v=20260930-complete" defer></script>
+  <script src="paper-export.js?v=20260930-complete" defer></script>
+  <script src="notebook-tools.js?v=20260930-complete" defer></script>
+  <script src="app.js?v=20260930-complete" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -29,18 +32,27 @@
           <button id="renamePageButton" class="icon-button rename-page-button" type="button" aria-label="重命名当前页" title="重命名当前页">✎</button>
         </nav>
         <div class="topbar-actions">
-          <button id="newNoteButton" class="button button-primary" type="button">＋ 新建笔记</button>
+          <button id="newNoteButton" class="button button-primary" type="button">＋ <span class="desktop-label">新建笔记</span><span class="mobile-label">新建</span></button>
           <button id="undoButton" class="button button-quiet" type="button" title="撤销上一步操作" disabled>撤销</button>
           <button id="redoButton" class="button button-quiet" type="button" title="恢复刚撤销的操作（重做）" disabled>恢复</button>
-          <button id="addImageButton" class="button button-quiet" type="button" title="将图片作为独立内容放到纸张上">图片</button>
           <label class="zoom-control"><span class="sr-only">纸张显示比例</span><select id="zoomSelect" aria-label="纸张显示比例" title="在纸张上滚轮缩放，拖动空白处移动查看；选择整页恢复"><option value="fit">整页</option><option value="1">100%</option><option value="1.5">150%</option><option value="2">200%</option><option value="4">400%</option><option value="8">800%</option></select></label>
+          <button id="moreButton" class="button button-quiet" type="button" aria-expanded="false" aria-controls="moreMenu" aria-describedby="syncLabel">更多</button>
           <div class="sync-status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">等待连接</span></div>
+          <div id="moreMenu" class="more-menu" aria-label="纸张工具" hidden>
+          <p id="moreSyncStatus" class="menu-sync-status" role="status">等待连接</p>
+          <button id="searchButton" class="button button-quiet" type="button">搜索所有纸张</button>
+          <button id="addImageButton" class="button button-quiet" type="button" title="将图片作为独立内容放到纸张上">插入图片</button>
+          <button id="paperExportButton" class="button button-quiet" type="button">导出 A4（PDF / 图片）</button>
+          <button id="versionsButton" class="button button-quiet" type="button">历史版本</button>
+          <button id="moveNoteButton" class="button button-quiet" type="button">移动所选笔记</button>
+          <button id="duplicatePageButton" class="button button-quiet" type="button">复制当前纸张</button>
           <button id="syncButton" class="button button-quiet" type="button">同步</button>
           <button id="lockButton" class="button button-quiet" type="button">锁定</button>
           <div class="backup-actions">
             <button id="importButton" class="button button-quiet" type="button">导入</button>
             <button id="exportButton" class="button button-quiet" type="button">备份</button>
             <input id="importFile" type="file" accept=".json,application/json" hidden>
+          </div>
           </div>
           <input id="imageFile" type="file" accept="image/png,image/jpeg,image/webp" hidden>
         </div>
@@ -55,13 +67,14 @@
               <div id="canvas" class="paper-canvas" aria-label="当前纸张上的笔记"></div>
             </div>
           </div>
-          <div id="overflowBadge" class="overflow-badge" role="status" hidden>纸张之外还有笔记 ↓</div>
+          <button id="overflowBadge" class="overflow-badge" type="button" aria-live="polite" hidden>查看纸张外的完整笔记 ↓</button>
           <section id="overflowArea" class="overflow-area" aria-label="纸张边界外的笔记" hidden></section>
         </div>
         <div id="touchNoteHandles" class="touch-note-handles" aria-label="所选笔记调整箭头" hidden>
           <button id="touchWidthHandle" class="touch-edge-handle" type="button" aria-label="调整横向宽度并重新换行" title="调整宽度">↔</button>
           <button id="touchScaleHandle" class="touch-edge-handle" type="button" aria-label="等比缩放文字与图片" title="缩放内容">↘</button>
         </div>
+        <button id="focusReturnButton" class="button focus-return" type="button" hidden>← 返回原位置</button>
       </section>
 
       <section id="editMode" class="edit-mode" aria-label="编辑笔记" hidden>
@@ -81,7 +94,7 @@
               <span id="editorOverflow" class="editor-overflow" role="status" hidden>正文超出当前纸张，将在纸张外完整显示。</span>
             </div>
             <div class="editor-actions">
-              <button id="moveToNewPageButton" class="button button-quiet" type="button">移到新页</button>
+              <button id="moveToNewPageButton" class="button button-quiet" type="button">移动笔记</button>
               <button id="deleteButton" class="button button-danger" type="button">删除笔记</button>
             </div>
           </div>
@@ -95,12 +108,14 @@
     <form id="setupView" class="access-view" autocomplete="off">
       <p class="eyebrow">首次使用</p>
       <h2 id="accessTitle">连接你的私有笔记</h2>
-      <p class="access-intro">笔记会保存在 <strong>zeranhub/personal-notes-data</strong> 私有仓库中，手机和电脑用同一仓库即可同步。</p>
-      <div class="access-guide">
+      <p class="access-intro">连接一次后，通过 6 位 PIN 解锁。手机和电脑使用同一私有仓库即可同步。</p>
+      <details class="access-guide">
+        <summary>如何获取 GitHub 访问令牌</summary>
         <p><strong>1.</strong> <a href="https://github.com/settings/personal-access-tokens/new?name=Personal%20Notebook&amp;target_name=zeranhub&amp;expires_in=180&amp;contents=write" target="_blank" rel="noopener noreferrer">到 GitHub 创建 Fine-grained token ↗</a></p>
         <p><strong>2.</strong> 仓库访问选择 <b>Only select repositories</b>，仅选 <b>personal-notes-data</b>；在 <b>Repository permissions</b> 中，将 <b>Contents</b> 设为 <b>Read and write</b>。</p>
         <p><strong>3.</strong> 复制令牌，粘贴到下方。令牌只填在这个网页里，请勿发到聊天或分享给他人。</p>
-      </div>
+        <p>笔记仓库：<b>zeranhub/personal-notes-data</b>，需保持私有。</p>
+      </details>
       <label class="access-field">GitHub 访问令牌
         <input id="tokenInput" type="password" placeholder="github_pat_…" required autocomplete="off" spellcheck="false">
       </label>
@@ -118,7 +133,7 @@
     </form>
     <form id="unlockView" class="access-view" autocomplete="off" hidden>
       <p class="eyebrow">欢迎回来</p>
-      <h2>解锁一页纸</h2>
+      <h2 id="unlockTitle">解锁一页纸</h2>
       <p class="access-intro">输入这台设备的 6 位 PIN，继续同步私有笔记。</p>
       <label class="access-field">6 位 PIN
         <input id="pinInput" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" minlength="6" placeholder="输入 6 位数字" required autocomplete="current-password">
@@ -127,6 +142,10 @@
       <p id="unlockError" class="access-error" role="alert" hidden></p>
       <button id="resetAccessButton" class="access-reset" type="button">换设备或忘记 PIN？重新连接</button>
     </form>
+  </dialog>
+  <dialog id="toolsDialog" class="tools-dialog" aria-labelledby="toolsTitle">
+    <div class="tools-heading"><h2 id="toolsTitle"></h2><button id="closeToolsButton" class="icon-button" type="button" aria-label="关闭工具">×</button></div>
+    <div id="toolsBody" class="tools-body"></div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>

@@ -168,8 +168,20 @@
     return hydrateImages(container, options);
   }
 
+  function assetIds(source) {
+    if (!parser || !marked?.walkTokens) return [];
+    const ids = new Set();
+    marked.walkTokens(parser.lexer(String(source ?? "")), token => {
+      if (token.type !== "image") return;
+      const match = /^onepage:([a-zA-Z0-9._-]{1,128})$/.exec(String(token.href ?? ""));
+      if (match) ids.add(match[1]);
+    });
+    return [...ids];
+  }
+
   window.OnePageMarkdown = Object.freeze({
     render,
+    assetIds,
     clearCache() { notifiedImages.clear(); }
   });
 })();

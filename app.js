@@ -4,6 +4,7 @@
   const PAPER_WIDTH = 794;
   const PAPER_HEIGHT = 1123;
   const LEGACY_STORAGE_KEY = "personal-notebook-v1";
+  const VIEW_STORAGE_KEY = "onepage-view:v1:zeranhub/personal-notes-data";
   const $ = id => document.getElementById(id);
   const ui = {
     pageTabs: $("pageTabs"), addPageButton: $("addPageButton"), renamePageButton: $("renamePageButton"),
@@ -23,7 +24,9 @@
     tokenInput: $("tokenInput"), newPinInput: $("newPinInput"), confirmPinInput: $("confirmPinInput"),
     pinInput: $("pinInput"), setupButton: $("setupButton"), unlockButton: $("unlockButton"),
     setupError: $("setupError"), unlockError: $("unlockError"), resetAccessButton: $("resetAccessButton"),
-    toast: $("toast")
+    moreButton: $("moreButton"), toolsDialog: $("toolsDialog"), focusReturnButton: $("focusReturnButton"),
+    searchButton: $("searchButton"), paperExportButton: $("paperExportButton"), versionsButton: $("versionsButton"),
+    moveNoteButton: $("moveNoteButton"), duplicatePageButton: $("duplicatePageButton"), toast: $("toast")
   };
   const transport = new window.NotebookSync({
     owner: "zeranhub", repo: "personal-notes-data", path: "data/notes.json"
@@ -54,6 +57,7 @@
   let editingWasNew = false;
   let migrationPending = false;
   let unlocked = false;
+  let locking = false;
   let remoteReady = false;
   let draftFailed = false;
   let draftPending = 0;
@@ -87,6 +91,10 @@
   let longPressTimer = null;
   let navigationId = crypto.randomUUID();
   let navigationBackPending = false;
+  let focusOrigin = null;
+  let viewSaveTimer = null;
+  let versionTimer = null;
+  let tools = null;
   const journal = new window.OnePageHistory();
   let historyBefore = null;
   let historySelectionBefore = null;
@@ -94,6 +102,7 @@
   const paperPointers = new Map();
   const pageViews = new Map();
   const assetUrls = new Map();
+  const assetBytesCache = new Map();
   const assetLoads = new Map();
   const measurementCache = new Map();
 
@@ -112,7 +121,8 @@
     return { data: canonical(parsed), migrated: Boolean(parsed.migrated) };
   }
 
-  function isCurrent(epoch) { return unlocked && epoch === session; }
+  function isSession(epoch) { return unlocked && epoch === session; }
+  function isCurrent(epoch) { return isSession(epoch) && !locking; }
   function isDirty() { return migrationPending || signature(state) !== signature(baseline); }
   function currentPage() { return pageById(viewPageId) || state.pages[0] || null; }
 
@@ -133,11 +143,14 @@
     const parent = ui.syncLabel.parentElement;
     parent.classList.toggle("is-synced", kind === "synced");
     parent.classList.toggle("is-error", kind === "error");
+    ui.moreButton.title = label;
+    $("moreSyncStatus").textContent = label;
+    $("moreSyncStatus").classList.toggle("is-error", kind === "error");
   }
 
   function errorText(error) {
     const messages = {
-      NETWORK_ERROR: "连接 GitHub 失败；加密草稿仍保存在这台设备。",
+      NETWORK_ERROR: draftFailed ? "无法连接云端，且本机保存失败，请立即备份。" : isDirty() ? "本机已保存，尚未同步；联网后自动重试。" : "无法连接 GitHub，请检查网络后重试。",
       RATE_LIMITED: "GitHub 请求较多，稍后自动重试。",
       UNAUTHORIZED: "访问令牌已失效，请锁定后重新连接。",
       FORBIDDEN: "GitHub 拒绝写入，请检查令牌的 Contents 权限是否为 Read and write。",
@@ -175,6 +188,7 @@
   function clearAssetUrls() {
     for (const url of assetUrls.values()) URL.revokeObjectURL(url);
     assetUrls.clear();
+    assetBytesCache.clear();
     assetLoads.clear();
     window.OnePageMarkdown.clearCache();
     measurementCache.clear();
@@ -284,6 +298,7 @@
         note.updatedAt = now();
       }
       state.assets[id] = asset;
+      assetBytesCache.set(id, prepared.bytes.slice());
       assetUrls.set(id, URL.createObjectURL(new Blob([prepared.bytes], { type: prepared.mime })));
       changed();
       render();
@@ -306,7 +321,7 @@
   function ensurePageImages(pageId) {
     const ids = new Set();
     for (const note of state.notes.filter(item => item.pageId === pageId)) {
-      for (const match of note.content.matchAll(/\(onepage:([A-Za-z0-9_-]+)\)/g)) ids.add(match[1]);
+      for (const id of window.OnePageMarkdown.assetIds(note.content)) ids.add(id);
     }
     const epoch = session;
     for (const id of ids) {
@@ -314,6 +329,7 @@
       if (!asset || assetUrls.has(id) || assetLoads.has(id)) continue;
       const task = transport.loadAsset(asset).then(bytes => {
         if (!isCurrent(epoch)) return;
+        assetBytesCache.set(id, bytes.slice());
         assetUrls.set(id, URL.createObjectURL(new Blob([bytes], { type: asset.mime })));
         if (mode === "view" && currentPage()?.id === pageId) renderView();
       }).catch(error => {
@@ -578,6 +594,33 @@
     if (viewPageId && mode === "view") pageViews.set(viewPageId, {
       zoom, left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop
     });
+    persistLocalView();
+  }
+
+  function persistLocalView() {
+    if (!unlocked || !viewPageId) return;
+    try { localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({ pageId: viewPageId, views: Object.fromEntries(pageViews) })); }
+    catch { /* Viewing preferences are optional; note drafts use guarded encryption. */ }
+  }
+
+  function loadLocalView() {
+    try {
+      const record = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) || "null");
+      if (!record || typeof record.pageId !== "string") return null;
+      for (const [id, value] of Object.entries(record.views || {}).slice(0, 100)) {
+        if (value && (value.zoom === "fit" || Number.isFinite(Number(value.zoom))) && Number.isFinite(value.left) && Number.isFinite(value.top)) {
+          pageViews.set(id, { zoom: value.zoom === "fit" ? "fit" : String(Math.max(0.02, Math.min(8, Number(value.zoom)))), left: Math.max(0, value.left), top: Math.max(0, value.top) });
+        }
+      }
+      return record.pageId;
+    } catch { return null; }
+  }
+
+  function selectedAnchor() {
+    const rect = lastLayout.placed.find(item => item.id === selectedNoteId);
+    if (!rect) return viewportAnchor();
+    const viewport = ui.paperViewport.getBoundingClientRect();
+    return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2, clientX: viewport.left + ui.paperViewport.clientWidth / 2, clientY: viewport.top + ui.paperViewport.clientHeight / 2 };
   }
 
   function restorePageView(id) {
@@ -606,8 +649,8 @@
   }
 
   function zoomPaperWheel(event) {
-    if (!unlocked || mode !== "view" || ui.accessDialog.open) return;
-    const overPaper = ui.paperViewport.contains(event.target) && !ui.overflowArea.contains(event.target);
+    if (!unlocked || mode !== "view" || ui.accessDialog.open || ui.toolsDialog.open) return;
+    const overPaper = ui.paperViewport.contains(event.target) && !ui.overflowArea.contains(event.target) && !ui.overflowBadge.contains(event.target);
     if (!overPaper && !(event.ctrlKey || event.metaKey)) return;
     event.preventDefault();
     if (activeMoveCleanup || paperGesture) return;
@@ -731,6 +774,21 @@
     else selectNote(id);
   }
 
+  function touchHitCard(x, y) {
+    const paper = ui.canvas.getBoundingClientRect();
+    const viewport = ui.paperViewport.getBoundingClientRect();
+    if (x < Math.max(paper.left, viewport.left) || x > Math.min(paper.right, viewport.right) ||
+        y < Math.max(paper.top, viewport.top) || y > Math.min(paper.bottom, viewport.bottom)) return null;
+    let nearest = null, distance = 22, layer = -1;
+    for (const card of ui.canvas.children) {
+      const box = card.getBoundingClientRect();
+      const gap = Math.hypot(Math.max(box.left - x, 0, x - box.right), Math.max(box.top - y, 0, y - box.bottom));
+      const z = Number(card.style.zIndex) || 0;
+      if (gap < distance || gap === distance && z > layer) { nearest = card; distance = gap; layer = z; }
+    }
+    return nearest;
+  }
+
   function beginPaperGesture(event) {
     if (event.pointerType !== "touch" || !unlocked || mode !== "view") return;
     if (event.target.closest("button") || paperPointers.has(event.pointerId)) return;
@@ -757,9 +815,9 @@
     }
     paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (paperPointers.size === 1) {
-      const card = event.target.closest(".note-card");
+      const card = event.target.closest(".note-card") || touchHitCard(event.clientX, event.clientY);
       const onPaper = card && ui.canvas.contains(card);
-      paperGesture = { target: event.target, down: event, startX: event.clientX, startY: event.clientY,
+      paperGesture = { target: card || event.target, down: event, startX: event.clientX, startY: event.clientY,
         left: ui.paperViewport.scrollLeft, top: ui.paperViewport.scrollTop, moved: false, pinched: false,
         noteId: card?.dataset.noteId || null, canDrag: onPaper && card.dataset.noteId === selectedNoteId };
       if (onPaper && !paperGesture.canDrag) longPressTimer = setTimeout(() => {
@@ -934,7 +992,8 @@
     card.className = `note-card${overflow ? " is-overflow" : ""}${note.conflictOf ? " is-conflict" : ""}`;
     card.tabIndex = 0;
     card.setAttribute("role", "button");
-    card.setAttribute("aria-label", overflow ? "选中纸张外的笔记，再次点击编辑" : "选中笔记，再次点击编辑");
+    const ordinal = state.notes.filter(item => item.pageId === note.pageId).findIndex(item => item.id === note.id) + 1;
+    card.setAttribute("aria-label", `${overflow ? "纸张外的" : ""}笔记 ${ordinal}：${note.content.trim().slice(0, 60) || "空笔记"}。按回车选中，再按回车编辑`);
     card.dataset.noteId = note.id;
     if (!overflow) {
       card.style.left = `${rect.x}px`;
@@ -944,9 +1003,10 @@
       const handle = document.createElement("button");
       handle.type = "button";
       handle.className = "drag-handle";
-      handle.setAttribute("aria-label", "拖动笔记位置");
+      handle.setAttribute("aria-label", "移动笔记位置，可用方向键，Shift 加大步幅");
       handle.title = "拖动位置";
       handle.addEventListener("pointerdown", event => beginMove(event, note, card, "drag"));
+      handle.addEventListener("keydown", event => adjustNoteByKeyboard(event, note.id, "drag"));
       handle.addEventListener("click", event => event.stopPropagation());
       card.append(handle);
     }
@@ -958,6 +1018,8 @@
     }
     const content = document.createElement("div");
     content.className = "note-card-content";
+    content.id = `note-content-${note.id}`;
+    card.setAttribute("aria-describedby", content.id);
     renderBody(content, note.content);
     // Image placeholders contain labels too; only actual prose or other
     // visible Markdown blocks make a card part of the upper text layer.
@@ -983,17 +1045,19 @@
       const width = document.createElement("button");
       width.type = "button";
       width.className = "width-handle";
-      width.setAttribute("aria-label", "调整横向宽度并重新换行");
+      width.setAttribute("aria-label", "调整横向宽度并重新换行，可用方向键，Shift 加大步幅");
       width.title = "调整宽度，字号不变";
       width.addEventListener("pointerdown", event => beginMove(event, note, card, "width"));
+      width.addEventListener("keydown", event => adjustNoteByKeyboard(event, note.id, "width"));
       width.addEventListener("click", event => event.stopPropagation());
       card.append(width);
       const resize = document.createElement("button");
       resize.type = "button";
       resize.className = "resize-handle";
-      resize.setAttribute("aria-label", "缩放正文和图片，内容框自动贴合");
+      resize.setAttribute("aria-label", "缩放正文和图片，可用方向键，Shift 加大步幅");
       resize.title = "等比缩放内容";
       resize.addEventListener("pointerdown", event => beginMove(event, note, card, "resize"));
+      resize.addEventListener("keydown", event => adjustNoteByKeyboard(event, note.id, "resize"));
       resize.addEventListener("click", event => event.stopPropagation());
       card.append(resize);
     }
@@ -1087,7 +1151,13 @@
       heading.className = "overflow-heading";
       heading.textContent = `${result.overflow.length} 篇笔记超出这张纸的容量，正文仍完整保留在纸张外。`;
       ui.overflowArea.append(heading);
-      for (const note of result.overflow) ui.overflowArea.append(createCard(note, null, true));
+      for (const note of result.overflow) {
+        ui.overflowArea.append(createCard(note, null, true));
+        const row = document.createElement("div"); row.className = "overflow-note-tools";
+        const move = document.createElement("button"); move.type = "button"; move.className = "button button-quiet";
+        move.textContent = "移动这篇笔记";
+        move.addEventListener("click", () => tools.move(note.id)); row.append(move); ui.overflowArea.append(row);
+      }
     }
     ui.overflowArea.hidden = result.overflow.length === 0;
     ui.overflowBadge.hidden = result.overflow.length === 0;
@@ -1096,6 +1166,7 @@
     ui.canvasViewport.classList.toggle("is-overflowing", result.overflow.length > 0);
     updatePaperScale();
     updateTouchSelection();
+    if (focusOrigin) ui.canvas.querySelector(`[data-note-id="${CSS.escape(selectedNoteId || "")}"]`)?.classList.add("is-search-target");
     renderTabs();
     ensurePageImages(page.id);
   }
@@ -1111,7 +1182,7 @@
     ui.capacityLabel.textContent = overflow
       ? "这篇笔记已经放不进当前纸张"
       : `当前纸张已用约 ${layout.percent}%`;
-    ui.moveToNewPageButton.disabled = state.pages.length >= 100;
+    ui.moveToNewPageButton.disabled = false;
   }
 
   function render() {
@@ -1135,6 +1206,7 @@
     editingId = null;
     render();
     restorePageView(id);
+    savePageView();
     replaceNavigationState();
   }
 
@@ -1326,16 +1398,16 @@
     };
     draftPending++;
     const task = draftQueue.catch(() => {}).then(async () => {
-      if (!isCurrent(epoch)) return false;
+      if (!isSession(epoch)) return false;
       try {
         await transport.saveDraft(snapshot);
-        if (isCurrent(epoch)) {
+        if (isSession(epoch)) {
           draftFailed = false;
-          if (number === changeNumber && isDirty()) setStatus("pending", "草稿已加密，等待同步");
+          if (number === changeNumber && isDirty()) setStatus("pending", "本机已保存 · 等待同步");
         }
         return true;
       } catch {
-        if (isCurrent(epoch)) {
+        if (isSession(epoch)) {
           draftFailed = true;
           setStatus("error", "加密草稿保存失败，请导出备份");
           toast("浏览器未能保存加密草稿，请立即导出备份。" );
@@ -1379,12 +1451,12 @@
   }
 
   function updateHistoryButtons() {
-    for (const button of [ui.undoButton, ui.editorUndoButton]) button.disabled = !unlocked || !journal.canUndo();
-    for (const button of [ui.redoButton, ui.editorRedoButton]) button.disabled = !unlocked || !journal.canRedo();
+    for (const button of [ui.undoButton, ui.editorUndoButton]) button.disabled = !unlocked || locking || !journal.canUndo();
+    for (const button of [ui.redoButton, ui.editorRedoButton]) button.disabled = !unlocked || locking || !journal.canRedo();
   }
 
   function applyHistory(direction) {
-    if (!unlocked || activeMoveCleanup || paperGesture || imageBusy) return;
+    if (!unlocked || locking || activeMoveCleanup || paperGesture || imageBusy) return;
     clearTimeout(layoutTimer);
     const result = journal[direction](state);
     if (!result.applied) {
@@ -1422,7 +1494,7 @@
   }
 
   function changed(group = null) {
-    if (!unlocked) return;
+    if (!unlocked || locking) return;
     if (!applyingHistory && historyBefore) journal.capture(historyBefore, state, {
       group, selectionBefore: historySelectionBefore, selectionAfter: historySelection()
     });
@@ -1433,6 +1505,8 @@
     setStatus("pending", "正在保存加密草稿…");
     queueDraft();
     scheduleSync();
+    clearTimeout(versionTimer);
+    versionTimer = setTimeout(() => saveVersion("本机保存"), 8000);
   }
 
   function scheduleRetry(code) {
@@ -1498,6 +1572,7 @@
       baseline = snapshot;
       sha = nextSha;
       migrationPending = false;
+      saveVersion("云端同步", snapshot);
       if (isDirty()) {
         queueDraft();
         setStatus("pending", "新修改等待同步");
@@ -1519,10 +1594,11 @@
       try { await task(epoch); }
       catch (error) {
         if (!isCurrent(epoch)) return;
+        if (isDirty()) await queueDraft();
+        if (!isCurrent(epoch)) return;
         const message = errorText(error);
         setStatus("error", message);
         toast(message);
-        if (isDirty()) queueDraft();
         scheduleRetry(error?.code);
       }
     });
@@ -1556,7 +1632,8 @@
     for (const item of [ui.addPageButton, ui.renamePageButton, ui.newNoteButton,
       ui.syncButton, ui.lockButton, ui.importButton, ui.exportButton,
       ui.backButton, ui.editorContent, ui.moveToNewPageButton, ui.deleteButton,
-      ui.addImageButton, ui.insertImageButton, ui.zoomSelect]) {
+      ui.addImageButton, ui.insertImageButton, ui.zoomSelect, ui.moreButton,
+      ui.searchButton, ui.paperExportButton, ui.versionsButton, ui.moveNoteButton, ui.duplicatePageButton]) {
       item.disabled = !allow;
     }
     updateHistoryButtons();
@@ -1564,10 +1641,12 @@
 
   function setDocumentReady(ready) {
     for (const item of [ui.addPageButton, ui.renamePageButton, ui.newNoteButton,
-      ui.importButton, ui.exportButton, ui.addImageButton]) item.disabled = !ready;
+      ui.importButton, ui.exportButton, ui.addImageButton, ui.searchButton, ui.paperExportButton,
+      ui.versionsButton, ui.moveNoteButton, ui.duplicatePageButton]) item.disabled = !ready;
   }
 
   function showAccess(which) {
+    ui.accessDialog.setAttribute("aria-labelledby", which === "setup" ? "accessTitle" : "unlockTitle");
     ui.setupView.hidden = which !== "setup";
     ui.unlockView.hidden = which !== "unlock";
     ui.setupError.hidden = true;
@@ -1577,19 +1656,31 @@
   }
 
   async function lock() {
-    if (!unlocked) return;
+    if (!unlocked || locking) return;
+    savePageView();
+    locking = true;
+    tools?.close();
+    clearTimeout(longPressTimer); longPressTimer = null;
+    clearTimeout(versionTimer);
+    pendingMouseCleanup?.(); mousePaperPanCleanup?.(); activeMoveCleanup?.();
+    activePaperDrag = null; paperPointers.clear(); paperGesture = null; deferredView = false;
     setAccess(false);
     clearTimeout(syncTimer);
     setStatus("pending", "正在保存加密草稿…");
     if (!await queueDraft()) {
+      locking = false;
       setAccess(true);
       setDocumentReady(remoteReady || state.pages.length > 0);
+      render();
       setStatus("error", "无法安全锁定，请先导出备份");
       toast("加密草稿保存失败，请先导出备份。" );
       return;
     }
+    if (isDirty()) await saveVersion("锁定前保存");
+    tools?.close();
     session++;
     unlocked = false;
+    locking = false;
     journal.reset(); historyBefore = historySelectionBefore = null;
     clearTimeout(longPressTimer); longPressTimer = null;
     pendingMouseCleanup?.();
@@ -1600,6 +1691,7 @@
     paperGesture = null;
     deferredView = false;
     selectedNoteId = null;
+    focusOrigin = null; ui.focusReturnButton.hidden = true;
     pageViews.clear();
     zoom = "fit";
     ui.touchNoteHandles.hidden = true;
@@ -1609,7 +1701,7 @@
     pendingImageTarget = null;
     remoteReady = false;
     setDocumentReady(false);
-    for (const timer of [syncTimer, retryTimer, pollTimer, layoutTimer]) clearTimeout(timer);
+    for (const timer of [syncTimer, retryTimer, pollTimer, layoutTimer, viewSaveTimer, versionTimer]) clearTimeout(timer);
     syncTimer = retryTimer = pollTimer = layoutTimer = null;
     transport.lock();
     clearAssetUrls();
@@ -1722,6 +1814,7 @@
     session++;
     const epoch = session;
     unlocked = true;
+    locking = false;
     journal.reset(); historyBefore = historySelectionBefore = null;
     navigationId = crypto.randomUUID(); navigationBackPending = false;
     remoteReady = false;
@@ -1732,6 +1825,7 @@
     viewPageId = editingId = null;
     mode = "view";
     migrationPending = false;
+    const preferredPageId = loadLocalView();
     ui.accessDialog.close();
     setAccess(true);
     setDocumentReady(false);
@@ -1764,6 +1858,10 @@
       await migrateLegacy(epoch);
       if (isDirty()) requestSync(false);
     }
+    if (state.pages.length) restorePageView(viewPageId);
+    if (pageById(preferredPageId)) selectPage(preferredPageId);
+    else if (state.pages.length) { restorePageView(viewPageId); savePageView(); }
+    await saveVersion("打开纸张");
     startPolling();
     rememberHistoryState();
     replaceNavigationState();
@@ -1811,6 +1909,8 @@
     try {
       await draftQueue.catch(() => {});
       transport.forget();
+      localStorage.removeItem(VIEW_STORAGE_KEY);
+      pageViews.clear();
       showAccess("setup");
     } catch {
       ui.unlockError.textContent = "无法清除本机授权信息，请检查浏览器存储设置。";
@@ -1826,8 +1926,13 @@
   });
   ui.zoomSelect.addEventListener("change", () => {
     if (ui.zoomSelect.value === "custom") return;
-    setPaperZoom(ui.zoomSelect.value);
+    setPaperZoom(ui.zoomSelect.value, selectedAnchor());
   });
+  document.addEventListener("pointerdown", () => {
+    // A fresh contact is deliberate. Only the click generated by the preceding
+    // drag/pinch release is suppressed, without delaying the next interaction.
+    suppressClickUntil = 0;
+  }, { capture: true });
   document.addEventListener("wheel", zoomPaperWheel, { capture: true, passive: false });
   ui.paperViewport.addEventListener("pointerdown", beginPaperGesture, { capture: true });
   ui.paperViewport.addEventListener("pointerdown", beginMousePaperPan);
@@ -1841,6 +1946,20 @@
   ui.paperViewport.addEventListener("pointerup", endPaperGesture);
   ui.paperViewport.addEventListener("pointercancel", endPaperGesture);
   ui.paperViewport.addEventListener("contextmenu", event => { if (touchDevice && unlocked) event.preventDefault(); });
+  ui.paperViewport.addEventListener("scroll", () => {
+    positionTouchTools();
+    clearTimeout(viewSaveTimer);
+    if (unlocked && mode === "view") viewSaveTimer = setTimeout(savePageView, 120);
+  }, { passive: true });
+  ui.overflowBadge.addEventListener("click", () => {
+    if (unlocked && !ui.overflowArea.hidden) ui.overflowArea.scrollIntoView({ block: "start" });
+  });
+  ui.focusReturnButton.addEventListener("click", returnFromFocus);
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && unlocked && mode === "view" && !ui.toolsDialog.open && focusOrigin) {
+      event.preventDefault(); returnFromFocus();
+    }
+  });
   for (const [button, kind] of [[ui.touchWidthHandle, "width"], [ui.touchScaleHandle, "resize"]]) {
     button.addEventListener("pointerdown", event => {
       const note = byId(selectedNoteId);
@@ -1848,6 +1967,7 @@
       if (note && card) beginMove(event, note, card, kind);
     });
     button.addEventListener("click", event => event.preventDefault());
+    button.addEventListener("keydown", event => adjustNoteByKeyboard(event, selectedNoteId, kind));
   }
   for (const button of [ui.undoButton, ui.editorUndoButton]) button.addEventListener("click", () => applyHistory("undo"));
   for (const button of [ui.redoButton, ui.editorRedoButton]) button.addEventListener("click", () => applyHistory("redo"));
@@ -1896,6 +2016,7 @@
     changed();
     render();
     restorePageView(page.id);
+    savePageView();
     replaceNavigationState();
   });
   ui.renamePageButton.addEventListener("click", () => {
@@ -1932,20 +2053,7 @@
     layoutTimer = setTimeout(renderEdit, 180);
   });
   ui.moveToNewPageButton.addEventListener("click", () => {
-    if (!unlocked || mode !== "edit") return;
-    const note = byId(editingId);
-    if (!note || state.pages.length >= 100) return;
-    const page = Model.createPage(state.pages.length, PAPER_WIDTH, PAPER_HEIGHT);
-    state.pages.push(page);
-    note.pageId = page.id;
-    note.x = note.y = note.w = note.h = null;
-    note.manualSize = note.manualPosition = false;
-    note.updatedAt = now();
-    viewPageId = page.id;
-    state.activePageId = page.id;
-    changed();
-    render();
-    toast("已移到新的一页纸。" );
+    if (unlocked && mode === "edit") tools.move(editingId);
   });
   ui.deleteButton.addEventListener("click", () => {
     if (!unlocked || mode !== "edit") return;
@@ -1966,12 +2074,6 @@
     toast("笔记已删除，可撤销。" );
   });
 
-  function bytesToBase64(bytes) {
-    let binary = "";
-    for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-    return btoa(binary);
-  }
-
   function backupBytes(value) {
     if (typeof value !== "string" || value.length > 1_400_000) throw new Error("INVALID_BACKUP_IMAGE");
     const binary = atob(value);
@@ -1991,67 +2093,204 @@
     }
   }
 
-  ui.exportButton.addEventListener("click", async () => {
-    if (!unlocked) return;
+  async function saveVersion(label, data = clone(state)) {
+    if (!unlocked || !data.pages.length) return;
+    try { await transport.saveVersionSnapshot(data, { sha, label }); }
+    catch { /* Note drafts are saved separately; a failed optional history never replaces them. */ }
+  }
+
+  function referencedAssets(data) {
+    const ids = new Set(data.notes.flatMap(note => window.OnePageMarkdown.assetIds(note.content)));
+    return Object.fromEntries(Object.entries(data.assets || {}).filter(([id]) => ids.has(id)));
+  }
+
+  async function readAssetBytes(asset) {
     const epoch = session;
-    const snapshot = clone(state);
-    ui.exportButton.disabled = true;
-    try {
-      const assetFiles = {};
-      for (const asset of Object.values(snapshot.assets || {})) {
-        const bytes = await transport.loadAsset(asset);
-        if (!isCurrent(epoch)) return;
-        assetFiles[asset.id] = bytesToBase64(bytes);
-      }
-      const payload = JSON.stringify({ ...snapshot, assetFiles, exportedAt: now() }, null, 2);
-      const url = URL.createObjectURL(new Blob([payload], { type: "application/json;charset=utf-8" }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `一页纸备份-${now().slice(0, 10)}.json`;
-      document.body.append(link);
-      link.click(); link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      toast("正文和图片已一起导出，请妥善保存。" );
-    } catch (error) {
-      if (isCurrent(epoch)) toast(`备份未完成：${errorText(error)}`);
-    } finally { if (isCurrent(epoch)) ui.exportButton.disabled = false; }
-  });
-  ui.importButton.addEventListener("click", () => { if (unlocked) ui.importFile.click(); });
-  ui.importFile.addEventListener("change", async () => {
+    if (assetBytesCache.has(asset.id)) return assetBytesCache.get(asset.id).slice();
+    if (assetLoads.has(asset.id)) await assetLoads.get(asset.id);
+    if (!isCurrent(epoch)) throw new Error("页面已锁定。");
+    if (assetBytesCache.has(asset.id)) return assetBytesCache.get(asset.id).slice();
+    const bytes = await transport.loadAsset(asset);
+    if (!isCurrent(epoch)) throw new Error("页面已锁定。");
+    assetBytesCache.set(asset.id, bytes.slice());
+    return bytes;
+  }
+
+  async function preparePaperExport(pageId) {
     const epoch = session;
-    const file = ui.importFile.files[0];
-    ui.importFile.value = "";
-    if (!file || !isCurrent(epoch) || (!remoteReady && !state.pages.length)) return;
-    if (file.size > 50 * 1024 * 1024) { toast("文件超过 50 MB，请选择较小的备份。" ); return; }
-    if (imageBusy) { toast("图片正在保存，请稍后导入。" ); return; }
-    imageBusy = true;
-    ui.importButton.disabled = true;
-    try {
-      const raw = JSON.parse(await file.text());
-      if (!isCurrent(epoch)) return;
-      const parsed = parseData(raw);
-      validateImportedAssets(parsed.data.assets || {});
-      if (state.pages.length + parsed.data.pages.length > 100 || state.notes.length + parsed.data.notes.length > 1000) {
-        throw new Error("LIMIT_EXCEEDED");
-      }
-      for (const asset of Object.values(parsed.data.assets || {})) {
-        if (raw.assetFiles?.[asset.id]) await uploadPrivateAsset(asset, backupBytes(raw.assetFiles[asset.id]));
-        else await transport.loadAsset(asset);
-        if (!isCurrent(epoch)) return;
-      }
-      const count = appendImported(parsed.data);
-      changed();
-      render();
-      toast(`已导入 ${count} 篇笔记，原有内容仍保留。`);
-    } catch (error) {
-      if (isCurrent(epoch)) toast(error?.message === "LIMIT_EXCEEDED"
-        ? "导入后会超过页面或笔记数量上限。" : "导入失败：备份格式或图片文件不完整，原有笔记已保留。" );
-    } finally {
-      if (isCurrent(epoch)) {
-        imageBusy = false;
-        ui.importButton.disabled = false;
-      }
+    if (mode === "edit") leaveEdit(true);
+    if (currentPage()?.id !== pageId) selectPage(pageId);
+    const ids = new Set(lastLayout.placed.flatMap(rect => {
+      const note = byId(rect.id);
+      return window.OnePageMarkdown.assetIds(note?.content || "");
+    }));
+    for (const id of ids) {
+      const asset = state.assets?.[id];
+      if (!asset) throw new Error("纸面有缺失图片，请补齐后再导出。");
+      const bytes = await readAssetBytes(asset);
+      if (!isCurrent(epoch)) throw new Error("页面已锁定。");
+      if (!assetUrls.has(id)) assetUrls.set(id, URL.createObjectURL(new Blob([bytes], { type: asset.mime })));
     }
+    if (!isCurrent(epoch)) throw new Error("页面已锁定。");
+    renderView();
+    await Promise.all([...ui.canvas.querySelectorAll("img")].map(image => image.decode()));
+    if (!isCurrent(epoch)) throw new Error("页面已锁定。");
+  }
+
+  function focusNote(id) {
+    const note = byId(id);
+    if (!unlocked || !note) return;
+    if (mode === "edit") leaveEdit(true);
+    savePageView();
+    if (!focusOrigin) focusOrigin = { pageId: viewPageId, zoom, left: ui.paperViewport.scrollLeft,
+      top: ui.paperViewport.scrollTop, noteId: selectedNoteId };
+    selectPage(note.pageId);
+    selectNote(id);
+    ui.focusReturnButton.hidden = false;
+    const card = ui.canvas.querySelector(`[data-note-id="${CSS.escape(id)}"]`);
+    if (card) {
+      setPaperZoom(Math.max(2, currentScale), selectedAnchor());
+      card.classList.add("is-search-target");
+    } else {
+      ui.overflowArea.querySelector(`[data-note-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "start" });
+    }
+  }
+
+  function returnFromFocus() {
+    if (!unlocked || !focusOrigin) return;
+    const origin = focusOrigin; focusOrigin = null; ui.focusReturnButton.hidden = true;
+    if (!pageById(origin.pageId)) return;
+    selectPage(origin.pageId);
+    pageViews.set(origin.pageId, { zoom: origin.zoom, left: origin.left, top: origin.top });
+    restorePageView(origin.pageId); savePageView();
+    if (byId(origin.noteId)?.pageId === origin.pageId) selectNote(origin.noteId);
+  }
+
+  function moveNote(id, targetId) {
+    if (!unlocked) return;
+    const note = byId(id); if (!note) return;
+    let page = pageById(targetId);
+    if (!targetId) {
+      if (state.pages.length >= 100) { toast("最多可建立 100 张一页纸。"); return; }
+      page = Model.createPage(state.pages.length, PAPER_WIDTH, PAPER_HEIGHT); state.pages.push(page);
+    }
+    if (!page || page.id === note.pageId) return;
+    savePageView();
+    note.pageId = page.id; note.x = note.y = null; note.manualPosition = false; note.updatedAt = now();
+    viewPageId = page.id; state.activePageId = page.id; selectedNoteId = note.id;
+    changed(); render();
+    if (mode === "view") { restorePageView(page.id); savePageView(); }
+    replaceNavigationState();
+    toast(`已移到「${page.name}」，字号和图片比例保持原样。`);
+  }
+
+  function duplicatePage() {
+    if (!unlocked || !currentPage()) return;
+    const sourcePage = currentPage();
+    const source = { ...empty(), pages: [clone(sourcePage)],
+      notes: clone(state.notes.filter(note => note.pageId === sourcePage.id)), assets: {} };
+    source.pages[0].name = `${sourcePage.name.slice(0, 96)} 副本`;
+    try {
+      savePageView(); appendImported(source); mode = "view"; editingId = null; selectedNoteId = null;
+      state.activePageId = viewPageId; changed(); render(); restorePageView(viewPageId); savePageView(); replaceNavigationState();
+      toast("已复制整张纸，内容和排版均已保留。");
+    } catch { toast("复制后会超过纸张或笔记数量上限。"); }
+  }
+
+  async function restoreVersionPage(source, pageId, current = () => true) {
+    const epoch = session, page = source.pages.find(item => item.id === pageId);
+    if (!page || !isCurrent(epoch) || !current()) return;
+    const copy = { ...empty(), pages: [{ ...page, name: `${page.name.slice(0, 96)} 恢复` }],
+      notes: clone(source.notes.filter(note => note.pageId === pageId)), assets: source.assets };
+    copy.assets = referencedAssets(copy); validateImportedAssets(copy.assets);
+    if (state.pages.length >= 100 || state.notes.length + copy.notes.length > 1000) throw new Error("恢复后会超过纸张或笔记数量上限。");
+    await saveVersion("恢复历史前");
+    if (!isCurrent(epoch) || !current()) return;
+    if (mode === "edit") leaveEdit(true);
+    savePageView(); appendImported(copy); state.activePageId = viewPageId;
+    selectedNoteId = null; changed(); render(); restorePageView(viewPageId); savePageView(); replaceNavigationState();
+  }
+
+  async function applyImportedBackup(raw, data, dedupe, current = () => true) {
+    const epoch = session;
+    if (imageBusy) throw new Error("图片正在保存，请稍后导入。");
+    const source = clone(data), known = new Set(state.notes.map(note => note.content));
+    if (dedupe) source.notes = source.notes.filter(note => {
+      if (known.has(note.content)) return false;
+      known.add(note.content); return true;
+    });
+    if (!source.notes.length) return 0;
+    const pageIds = new Set(source.notes.map(note => note.pageId));
+    source.pages = source.pages.filter(page => pageIds.has(page.id));
+    source.assets = referencedAssets(source); validateImportedAssets(source.assets);
+    if (state.pages.length + source.pages.length > 100 || state.notes.length + source.notes.length > 1000) throw new Error("导入后会超过纸张或笔记数量上限。");
+    imageBusy = true;
+    try {
+      for (const asset of Object.values(source.assets)) {
+        let bytes;
+        if (raw.assetFiles?.[asset.id]) {
+          bytes = backupBytes(raw.assetFiles[asset.id]);
+          await uploadPrivateAsset(asset, bytes);
+        } else if (raw.backupKind !== "text-only") bytes = await readAssetBytes(asset);
+        if (!isCurrent(epoch) || !current()) return 0;
+        if (bytes) {
+          assetBytesCache.set(asset.id, bytes.slice());
+          if (!assetUrls.has(asset.id)) assetUrls.set(asset.id, URL.createObjectURL(new Blob([bytes], { type: asset.mime })));
+        }
+      }
+      await saveVersion("导入备份前");
+      if (!isCurrent(epoch) || !current()) return 0;
+      if (mode === "edit") leaveEdit(true);
+      savePageView(); const added = appendImported(source); state.activePageId = viewPageId;
+      selectedNoteId = null; changed(); render(); restorePageView(viewPageId); savePageView(); replaceNavigationState();
+      return added;
+    } finally { if (isCurrent(epoch)) imageBusy = false; }
+  }
+
+  function adjustNoteByKeyboard(event, id, kind) {
+    if (!unlocked || mode !== "view" || activeMoveCleanup || paperGesture) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault(); event.stopPropagation(); toast("用方向键调整；按住 Shift 可加大步幅。移动和宽度均限制在 A4 内。"); return;
+    }
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault(); event.stopPropagation();
+    const note = byId(id), start = lastLayout.placed.find(rect => rect.id === id), page = currentPage();
+    if (!note || !start || !page) return;
+    const step = event.shiftKey ? 10 : 1, increase = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
+    let next = { ...start }, scale = noteScale(note);
+    if (kind === "drag") {
+      next.x = Math.max(Layout.MARGIN, Math.min(page.width - Layout.MARGIN - start.w, start.x + (event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0)));
+      next.y = Math.max(Layout.MARGIN, Math.min(page.height - Layout.MARGIN - start.h, start.y + (event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0)));
+    } else if (kind === "width") {
+      const size = contentSize(Math.max(2 + 6 * scale, Math.min(page.width - Layout.MARGIN - start.x, start.w + increase * step)), note.content, scale);
+      next.w = size.w; next.h = size.h;
+    } else {
+      const newScale = Math.max(0.25, Math.min(8, scale + increase * (event.shiftKey ? 0.2 : 0.02)));
+      const factor = newScale / scale;
+      next.w = 2 + (start.w - 2) * factor; next.h = 2 + (start.h - 2) * factor; scale = newScale;
+    }
+    if (!Layout.isWithinBounds(next, page)) { toast("已到达这张纸的边界。"); return; }
+    note.x = next.x; note.y = next.y; note.w = next.w; note.h = next.h; note.manualPosition = true;
+    if (kind !== "drag") { note.manualSize = true; note.contentScale = scale; }
+    raiseNoteLayer(note); note.updatedAt = now(); selectedNoteId = id;
+    changed(`keyboard:${id}:${kind}`); renderView();
+    const selector = kind === "drag" ? ".drag-handle" : kind === "width" ? ".width-handle" : ".resize-handle";
+    ui.canvas.querySelector(`[data-note-id="${CSS.escape(id)}"] ${selector}`)?.focus({ preventScroll: true });
+  }
+
+  tools = window.OnePageTools.attach({
+    session: () => session, current: isCurrent, unlocked: () => unlocked && !locking,
+    state: () => state, note: byId, selected: () => mode === "edit" ? editingId : selectedNoteId,
+    page: currentPage, canvas: ui.canvas, transport, toast, error: errorText, parse: parseData,
+    validateAssets: validateImportedAssets, selectPage, focusNote, moveNote, duplicatePage,
+    assetBytes: readAssetBytes, ensureImages: preparePaperExport,
+    importBackup: applyImportedBackup, restoreVersion: restoreVersionPage
+  });
+  ui.exportButton.addEventListener("click", () => tools.backup());
+  ui.importButton.addEventListener("click", () => { if (unlocked) ui.importFile.click(); });
+  ui.importFile.addEventListener("change", () => {
+    const file = ui.importFile.files[0]; ui.importFile.value = "";
+    if (file && unlocked && (remoteReady || state.pages.length)) tools.importFile(file);
   });
 
   window.addEventListener("online", () => { if (unlocked) requestSync(true); });
@@ -2074,7 +2313,7 @@
     }
   });
   document.addEventListener("keydown", event => {
-    if (!unlocked || ui.accessDialog.open || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+    if (!unlocked || locking || ui.accessDialog.open || ui.toolsDialog.open || !(event.ctrlKey || event.metaKey) || event.altKey) return;
     if (mode === "view" && ["+", "=", "-", "_", "0"].includes(event.key)) {
       event.preventDefault();
       if (activeMoveCleanup || paperGesture) return;
