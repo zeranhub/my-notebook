@@ -26,6 +26,7 @@
     setupError: $("setupError"), unlockError: $("unlockError"), resetAccessButton: $("resetAccessButton"),
     moreButton: $("moreButton"), toolsDialog: $("toolsDialog"), focusReturnButton: $("focusReturnButton"),
     searchButton: $("searchButton"), paperExportButton: $("paperExportButton"), versionsButton: $("versionsButton"),
+    paperSettingsButton: $("paperSettingsButton"),
     moveNoteButton: $("moveNoteButton"), duplicatePageButton: $("duplicatePageButton"), toast: $("toast")
   };
   const transport = new window.NotebookSync({
@@ -40,7 +41,8 @@
   // dirty only when its user-visible data or geometry changes.
   const signature = value => JSON.stringify({
     assets: value.assets || {},
-    pages: value.pages.map(p => [p.id, p.name, p.width, p.height, p.conflictOf || null]),
+    pages: value.pages.map(p => [p.id, p.name, p.width, p.height, p.paperWidthMm, p.paperHeightMm,
+      p.paperPreset, p.paperColor, p.conflictOf || null]),
     notes: value.notes.map(n => [n.id, n.pageId, n.content, n.x, n.y, n.w, n.h,
       n.manualSize, n.manualPosition, n.contentScale ?? 1, n.layer ?? 0, n.conflictOf || null, n.legacyTags || null])
   });
@@ -556,9 +558,16 @@
   function updateMobileViewport() {
     const viewport = window.visualViewport;
     const height = viewport?.height || window.innerHeight;
+    const width = viewport?.width || document.documentElement.clientWidth || window.innerWidth;
     const offset = viewport?.offsetTop || 0;
+    const left = viewport?.offsetLeft || 0;
     document.documentElement.style.setProperty("--app-viewport-height", `${Math.max(1, height)}px`);
     document.documentElement.style.setProperty("--app-viewport-top", `${Math.max(0, offset)}px`);
+    document.documentElement.style.setProperty("--app-viewport-width", `${Math.max(1, width)}px`);
+    document.documentElement.style.setProperty("--app-viewport-left", `${Math.max(0, left)}px`);
+    document.body.classList.toggle("is-compact-layout", width <= 1200);
+    document.body.classList.toggle("is-mobile-layout", width <= 740 || touchDevice);
+    document.querySelector(".topbar-main").classList.toggle("is-brandless", getComputedStyle(document.querySelector(".brand")).display === "none");
   }
 
   function fitScale() {
@@ -569,7 +578,7 @@
     const warningStyle = ui.overflowBadge.hidden ? null : getComputedStyle(ui.overflowBadge);
     const warningHeight = warningStyle ? ui.overflowBadge.offsetHeight + parseFloat(warningStyle.marginTop) + parseFloat(warningStyle.marginBottom) : 0;
     const height = Math.max(1, ui.paperViewport.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom) - warningHeight);
-    return Math.max(0.02, Math.min(1, width / page.width, height / page.height));
+    return Math.max(0.02, Math.min(8, width / page.width, height / page.height));
   }
 
   function paperAnchor(clientX, clientY) {
@@ -674,8 +683,17 @@
     currentScale = zoom === "fit" ? fitScale() : clampPaperScale(Number(zoom));
     ui.viewMode.classList.toggle("is-zoomed", zoom !== "fit");
     ui.canvasViewport.style.setProperty("--page-scale", String(currentScale));
+    ui.canvasViewport.style.setProperty("--paper-width", `${page.width}px`);
+    ui.canvasViewport.style.setProperty("--paper-height", `${page.height}px`);
+    ui.canvasViewport.style.setProperty("--paper-color", window.OnePagePaper.resolve(page).paperColor);
     ui.canvasViewport.style.setProperty("--scaled-page-width", `${Math.round(page.width * currentScale)}px`);
     ui.canvasViewport.style.setProperty("--scaled-page-height", `${Math.round(page.height * currentScale)}px`);
+    const paperStyle = getComputedStyle(ui.paperViewport);
+    const noticeStyle = ui.overflowBadge.hidden ? null : getComputedStyle(ui.overflowBadge);
+    const noticeHeight = noticeStyle ? ui.overflowBadge.offsetHeight + parseFloat(noticeStyle.marginTop) + parseFloat(noticeStyle.marginBottom) : 0;
+    const freeHeight = Math.max(0, ui.paperViewport.clientHeight - parseFloat(paperStyle.paddingTop) - parseFloat(paperStyle.paddingBottom) - noticeHeight - Math.round(page.height * currentScale));
+    ui.canvasViewport.style.marginTop = `${Math.floor(freeHeight / 2)}px`;
+    ui.canvasViewport.style.marginBottom = `${Math.ceil(freeHeight / 2)}px`;
     let custom = ui.zoomSelect.querySelector('option[value="custom"]');
     if (!custom) {
       custom = document.createElement("option");
@@ -1208,6 +1226,8 @@
     restorePageView(id);
     savePageView();
     replaceNavigationState();
+    // Viewing another page is not an edit, but the next undo must return here.
+    historySelectionBefore = historySelection();
   }
 
   function replaceNavigationState() {
@@ -1633,7 +1653,7 @@
       ui.syncButton, ui.lockButton, ui.importButton, ui.exportButton,
       ui.backButton, ui.editorContent, ui.moveToNewPageButton, ui.deleteButton,
       ui.addImageButton, ui.insertImageButton, ui.zoomSelect, ui.moreButton,
-      ui.searchButton, ui.paperExportButton, ui.versionsButton, ui.moveNoteButton, ui.duplicatePageButton]) {
+      ui.searchButton, ui.paperSettingsButton, ui.paperExportButton, ui.versionsButton, ui.moveNoteButton, ui.duplicatePageButton]) {
       item.disabled = !allow;
     }
     updateHistoryButtons();
@@ -1641,7 +1661,7 @@
 
   function setDocumentReady(ready) {
     for (const item of [ui.addPageButton, ui.renamePageButton, ui.newNoteButton,
-      ui.importButton, ui.exportButton, ui.addImageButton, ui.searchButton, ui.paperExportButton,
+      ui.importButton, ui.exportButton, ui.addImageButton, ui.searchButton, ui.paperSettingsButton, ui.paperExportButton,
       ui.versionsButton, ui.moveNoteButton, ui.duplicatePageButton]) item.disabled = !ready;
   }
 
@@ -1748,7 +1768,7 @@
     for (const oldPage of source.pages) {
       if (useExistingPage) pageMap.set(oldPage.id, state.pages[0].id);
       else {
-        const page = Model.createPage(state.pages.length, PAPER_WIDTH, PAPER_HEIGHT);
+        const page = Model.createPage(state.pages.length, oldPage);
         page.name = oldPage.name;
         state.pages.push(page);
         pageMap.set(oldPage.id, page.id);
@@ -1775,7 +1795,7 @@
       note.createdAt = oldNote.createdAt;
       note.updatedAt = oldNote.updatedAt;
       if (oldNote.legacyTags) note.legacyTags = [...oldNote.legacyTags];
-      // Saved overlaps are retained; positions are still constrained to A4.
+      // Saved overlaps are retained; layout uses the target paper's fixed boundary.
       state.notes.push(note);
       added++;
     }
@@ -2006,7 +2026,7 @@
   ui.addPageButton.addEventListener("click", () => {
     if (!unlocked || (!remoteReady && !state.pages.length)) return;
     if (state.pages.length >= 100) { toast("最多可建立 100 张一页纸。" ); return; }
-    const page = Model.createPage(state.pages.length, PAPER_WIDTH, PAPER_HEIGHT);
+    const page = Model.createPage(state.pages.length, currentPage() || undefined);
     savePageView();
     selectedNoteId = null;
     state.pages.push(page);
@@ -2172,7 +2192,7 @@
     let page = pageById(targetId);
     if (!targetId) {
       if (state.pages.length >= 100) { toast("最多可建立 100 张一页纸。"); return; }
-      page = Model.createPage(state.pages.length, PAPER_WIDTH, PAPER_HEIGHT); state.pages.push(page);
+      page = Model.createPage(state.pages.length, pageById(note.pageId) || undefined); state.pages.push(page);
     }
     if (!page || page.id === note.pageId) return;
     savePageView();
@@ -2195,6 +2215,21 @@
       state.activePageId = viewPageId; changed(); render(); restorePageView(viewPageId); savePageView(); replaceNavigationState();
       toast("已复制整张纸，内容和排版均已保留。");
     } catch { toast("复制后会超过纸张或笔记数量上限。"); }
+  }
+
+  function applyPaperSettings(id, settings) {
+    if (!unlocked || locking) return;
+    const page = pageById(id);
+    if (!page) throw new Error("这张纸已经不存在，请重新选择。");
+    const next = window.OnePagePaper.normalize(settings);
+    if (equal(window.OnePagePaper.normalize(page), next)) return;
+    Object.assign(page, next);
+    page.updatedAt = now();
+    pageViews.set(id, { zoom: "fit", left: 0, top: 0 });
+    if (viewPageId === id) zoom = "fit";
+    changed(); render();
+    if (mode === "view") { restorePageView(id); savePageView(); }
+    toast(lastLayout.overflow.length ? "纸张已更新；放不下的正文仍完整保留在纸张外。" : "纸张尺寸和底色已保存。");
   }
 
   async function restoreVersionPage(source, pageId, current = () => true) {
@@ -2250,7 +2285,7 @@
   function adjustNoteByKeyboard(event, id, kind) {
     if (!unlocked || mode !== "view" || activeMoveCleanup || paperGesture) return;
     if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault(); event.stopPropagation(); toast("用方向键调整；按住 Shift 可加大步幅。移动和宽度均限制在 A4 内。"); return;
+      event.preventDefault(); event.stopPropagation(); toast("用方向键调整；按住 Shift 可加大步幅。移动和宽度均限制在纸张内。"); return;
     }
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
     event.preventDefault(); event.stopPropagation();
@@ -2281,7 +2316,7 @@
   tools = window.OnePageTools.attach({
     session: () => session, current: isCurrent, unlocked: () => unlocked && !locking,
     state: () => state, note: byId, selected: () => mode === "edit" ? editingId : selectedNoteId,
-    page: currentPage, canvas: ui.canvas, transport, toast, error: errorText, parse: parseData,
+    page: currentPage, canvas: ui.canvas, transport, toast, error: errorText, parse: parseData, applyPaperSettings,
     validateAssets: validateImportedAssets, selectPage, focusNote, moveNote, duplicatePage,
     assetBytes: readAssetBytes, ensureImages: preparePaperExport,
     importBackup: applyImportedBackup, restoreVersion: restoreVersionPage
@@ -2332,6 +2367,10 @@
   window.addEventListener("resize", resizeViewport);
   window.visualViewport?.addEventListener("resize", resizeViewport);
   window.visualViewport?.addEventListener("scroll", updateMobileViewport);
+  const paperSizeObserver = new ResizeObserver(() => {
+    if (unlocked && mode === "view" && !paperGesture && !activeMoveCleanup) updatePaperScale(viewportAnchor());
+  });
+  paperSizeObserver.observe(ui.paperViewport);
   window.addEventListener("beforeunload", event => {
     if (unlocked && (draftPending > 0 || draftFailed || imageBusy)) {
       event.preventDefault();

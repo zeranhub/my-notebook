@@ -150,10 +150,75 @@
       button(row, "下载完整备份", () => save(false), true, "backup-complete");
       button(row, "下载文字应急备份", () => save(true), false, "backup-text");
     }
+    function paperSettings() {
+      if (!ctx.unlocked() || !ctx.page()) return;
+      const page = ctx.page(), Paper = window.OnePagePaper, initial = Paper.resolve(page);
+      const current = open("纸张尺寸与底色");
+      message("只设置这张纸。每张纸始终有固定边界；改变尺寸后，放不下的正文仍完整保留在纸张外。");
+      const preset = field("纸张类型", node("select")); preset.id = "paperPresetSelect";
+      for (const item of Paper.presets) {
+        const option = node("option", item.kind === "ratio" ? `${item.label} 比例` : item.label);
+        option.value = item.id; preset.append(option);
+      }
+      preset.value = initial.paperPreset;
+      const orientation = field("方向", node("select")); orientation.id = "paperOrientationSelect";
+      for (const [value, label] of [["portrait", "竖版"], ["landscape", "横版"]]) {
+        const option = node("option", label); option.value = value; orientation.append(option);
+      }
+      orientation.value = initial.orientation;
+      const custom = node("div", "", "paper-size-fields"); body.append(custom);
+      function dimensionInput(label, id, value) {
+        const input = node("input"); input.id = id; input.type = "number"; input.className = "tool-field";
+        input.min = String(Paper.minMm); input.max = String(Paper.maxMm); input.step = "any";
+        // Keep exact converted dimensions: rounding an endpoint can invalidate a valid page.
+        input.value = String(value);
+        const labelNode = node("label", label, "tool-intro"); labelNode.append(input); custom.append(labelNode); return input;
+      }
+      const shortSide = dimensionInput("短边（毫米）", "paperWidthMmInput", Math.min(initial.paperWidthMm, initial.paperHeightMm));
+      const longSide = dimensionInput("长边（毫米）", "paperHeightMmInput", Math.max(initial.paperWidthMm, initial.paperHeightMm));
+      const colorRow = node("div", "", "paper-color-control"); body.append(colorRow);
+      const colorLabel = node("label", "底色", "tool-intro"), colorPreset = node("select");
+      colorPreset.className = "tool-field"; colorPreset.id = "paperColorSelect";
+      for (const item of Paper.colors) { const option = node("option", item.label); option.value = item.value; colorPreset.append(option); }
+      const customColor = node("option", "自选颜色"); customColor.value = "custom"; colorPreset.append(customColor);
+      colorLabel.append(colorPreset); colorRow.append(colorLabel);
+      const color = node("input"); color.type = "color"; color.id = "paperColorInput"; color.value = initial.paperColor;
+      color.setAttribute("aria-label", "自选纸张底色"); colorRow.append(color);
+      const preview = node("div", "", "paper-setting-preview"), sheet = node("div", "", "paper-preview-sheet"), caption = node("p", "", "paper-preview-caption");
+      preview.append(sheet, caption); body.append(preview);
+      const status = message("尺寸与底色会自动保存，并随笔记同步。"), row = actions();
+      const apply = button(row, "应用到这张纸", () => {
+        if (!current()) return;
+        try { ctx.applyPaperSettings(page.id, settings()); close(); }
+        catch (error) { status.classList.add("is-error"); status.textContent = error.message || "请检查纸张设置。"; }
+      }, true, "paper-settings-apply");
+      button(row, "取消", close, false, "paper-settings-cancel");
+      function settings() {
+        return Paper.createSettings({ preset: preset.value, orientation: orientation.value,
+          widthMm: Number(shortSide.value), heightMm: Number(longSide.value), color: color.value });
+      }
+      function update() {
+        if (!current()) return;
+        custom.hidden = preset.value !== "custom";
+        colorPreset.value = Paper.colors.some(item => item.value === color.value) ? color.value : "custom";
+        try {
+          const next = settings(), factor = Math.min(180 / next.width, 190 / next.height);
+          if (preset.value !== "custom") { shortSide.value = String(Math.min(next.paperWidthMm, next.paperHeightMm)); longSide.value = String(Math.max(next.paperWidthMm, next.paperHeightMm)); }
+          sheet.style.width = `${next.width * factor}px`; sheet.style.height = `${next.height * factor}px`; sheet.style.backgroundColor = next.paperColor;
+          const format = Paper.presets.find(item => item.id === next.paperPreset)?.label || "自定义";
+          const mm = value => Number(value.toFixed(2));
+          caption.textContent = `${format} · ${next.width > next.height ? "横版" : "竖版"} · ${mm(next.paperWidthMm)} × ${mm(next.paperHeightMm)} 毫米`;
+          status.classList.remove("is-error"); status.textContent = "尺寸与底色会自动保存，并随笔记同步。"; apply.disabled = false;
+        } catch (error) { status.classList.add("is-error"); status.textContent = error.message; apply.disabled = true; }
+      }
+      for (const item of [preset, orientation, shortSide, longSide, color]) item.addEventListener("input", update);
+      colorPreset.addEventListener("change", () => { if (colorPreset.value !== "custom") color.value = colorPreset.value; update(); });
+      update();
+    }
     function paperExport() {
       if (!ctx.unlocked()) return;
-      const current = open("导出当前 A4");
-      message("按纸张实际排版导出，只包含 A4 边界内的内容。越界笔记可先移动到另一张纸。导出文件包含私人内容，请妥善保存。");
+      const current = open("导出当前纸张");
+      message("保留这张纸的尺寸、方向、底色和实际排版，只包含纸张边界内的内容。越界笔记可先移动到另一张纸。导出文件包含私人内容，请妥善保存。");
       const status = message("文字、图片和重叠层次按当前纸面保留。"), row = actions();
       let busy = false;
       async function save(format) {
@@ -171,7 +236,7 @@
         } catch (error) { if (current()) { status.classList.add("is-error"); status.textContent = error.message || "导出失败，请确认图片已加载后重试。"; } }
         finally { busy = false; if (current()) for (const item of row.querySelectorAll("button")) item.disabled = false; }
       }
-      button(row, "下载 A4 PDF", () => save("pdf"), true, "export-pdf");
+      button(row, "下载纸张 PDF", () => save("pdf"), true, "export-pdf");
       button(row, "下载 PNG 图片", () => save("png"), false, "export-png");
     }
     async function importFile(file) {
@@ -276,12 +341,30 @@
       }
       if (current()) await loadRemote();
     }
+    function positionMenu() {
+      if (menu.hidden || !ctx.unlocked()) return;
+      const rect = more.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const left = viewport?.offsetLeft || 0, top = viewport?.offsetTop || 0, width = viewport?.width || innerWidth, height = viewport?.height || innerHeight;
+      const menuTop = Math.max(top + 8, Math.min(rect.bottom + 6, top + height - 88));
+      menu.style.right = "auto";
+      menu.style.left = `${Math.max(left + 12, Math.min(rect.right - menu.offsetWidth, left + width - menu.offsetWidth - 12))}px`;
+      menu.style.top = `${menuTop}px`;
+      menu.style.maxHeight = `${Math.max(1, top + height - menuTop - 8)}px`;
+    }
     more.addEventListener("click", () => {
       if (!ctx.unlocked()) return;
       menu.hidden = !menu.hidden; more.setAttribute("aria-expanded", String(!menu.hidden));
-      const rect = more.getBoundingClientRect(); menu.style.top = `${Math.max(8, rect.bottom + 6)}px`;
-      menu.style.maxHeight = `${Math.max(100, (window.visualViewport?.height || innerHeight) - rect.bottom - 20)}px`;
+      positionMenu();
     });
+    let menuFrame = null;
+    function refreshMenuPosition() {
+      if (menu.hidden || menuFrame !== null) return;
+      menuFrame = requestAnimationFrame(() => { menuFrame = null; positionMenu(); });
+    }
+    window.addEventListener("resize", refreshMenuPosition);
+    window.visualViewport?.addEventListener("resize", refreshMenuPosition);
+    window.visualViewport?.addEventListener("scroll", refreshMenuPosition);
     document.addEventListener("pointerdown", event => { if (!menu.contains(event.target) && !more.contains(event.target)) hideMenu(); });
     menu.addEventListener("click", event => { if (event.target.closest("button")) hideMenu(); });
     $("closeToolsButton").addEventListener("click", close);
@@ -291,6 +374,7 @@
       generation++; hideMenu(); body.replaceChildren(); title.textContent = "";
     });
     $("searchButton").addEventListener("click", search);
+    $("paperSettingsButton")?.addEventListener("click", paperSettings);
     $("moveNoteButton").addEventListener("click", () => move());
     $("duplicatePageButton").addEventListener("click", () => { if (ctx.unlocked()) ctx.duplicatePage(); });
     $("versionsButton").addEventListener("click", versions);
@@ -299,7 +383,7 @@
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && ctx.unlocked()) { event.preventDefault(); search(); }
       if (event.key === "Escape") hideMenu();
     });
-    return Object.freeze({ close, search, move, backup, paperExport, importFile, versions });
+    return Object.freeze({ close, search, move, backup, paperSettings, paperExport, importFile, versions });
   }
   window.OnePageTools = Object.freeze({ attach });
 })();

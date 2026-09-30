@@ -5,6 +5,7 @@
 
   const DEFAULT_WIDTH = 794;
   const DEFAULT_HEIGHT = 1123;
+  const Paper = typeof window !== "undefined" ? window.OnePagePaper : require("./paper-settings.js");
   const MAX_PAGES = 100;
   const MAX_NOTES = 1000;
   const MAX_ASSETS = 3000;
@@ -137,8 +138,8 @@
     const page = {
       id: raw.id,
       name,
-      width: pageDimension(raw.width, "页面宽度"),
-      height: pageDimension(raw.height, "页面高度"),
+      ...Paper.normalize({ ...raw, width: pageDimension(raw.width, "页面宽度"),
+        height: pageDimension(raw.height, "页面高度") }),
       createdAt: dateOrNow(raw.createdAt, now),
       updatedAt: dateOrNow(raw.updatedAt, now)
     };
@@ -186,7 +187,7 @@
       fail("LIMIT_EXCEEDED", "旧笔记数量超过上限。" );
     }
     const page = {
-      id: "page-1", name: "第 1 页", width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT,
+      id: "page-1", name: "第 1 页", ...Paper.createSettings(),
       createdAt: timestamp(), updatedAt: timestamp()
     };
     const used = new Set();
@@ -233,7 +234,7 @@
     }
     const pages = value.pages.length
       ? value.pages.map(normalizePage)
-      : [{ id: "page-1", name: "第 1 页", width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT,
+      : [{ id: "page-1", name: "第 1 页", ...Paper.createSettings(),
         createdAt: timestamp(), updatedAt: timestamp() }];
     const pageIds = new Set(pages.map(page => page.id));
     if (pageIds.size !== pages.length) fail("INVALID_DATA", "页面标识重复。");
@@ -247,15 +248,13 @@
     if (!Number.isInteger(index) || index < 0 || index >= MAX_PAGES) {
       fail("INVALID_INDEX", "页面序号超出范围。");
     }
-    if (isRecord(width)) {
-      height = width.height;
-      width = width.width;
-    }
+    const settings = isRecord(width) ? Paper.normalize({ ...width,
+      width: pageDimension(width.width, "页面宽度"), height: pageDimension(width.height, "页面高度") })
+      : Paper.normalize({ width: pageDimension(width, "页面宽度"), height: pageDimension(height, "页面高度") });
     const now = timestamp();
     return {
       id: newId("page"), name: `第 ${index + 1} 页`,
-      width: pageDimension(width, "页面宽度"),
-      height: pageDimension(height, "页面高度"),
+      ...settings,
       createdAt: now, updatedAt: now
     };
   }
@@ -275,9 +274,30 @@
   function signature(item, kind) {
     if (!item) return null;
     return kind === "page"
-      ? JSON.stringify([item.name, item.width, item.height, item.conflictOf ?? null])
+      ? JSON.stringify([item.name, item.width, item.height, item.paperWidthMm, item.paperHeightMm,
+        item.paperPreset, item.paperColor, item.conflictOf ?? null])
       : JSON.stringify([item.pageId, item.content, item.contentScale, item.layer, item.x, item.y, item.w, item.h,
         item.manualSize, item.manualPosition, item.conflictOf ?? null, item.legacyTags ?? null]);
+  }
+
+  function mergePageFields(base, local, remote) {
+    if (!base || !local || !remote) return null;
+    const result = clone(remote);
+    // A paper's dimensions, physical size and format always travel together.
+    // Colour and name can merge independently from a format change.
+    const groups = [["name"], [...Paper.sizeFields], ["paperColor"], ["conflictOf"]];
+    for (const fields of groups) {
+      const value = item => JSON.stringify(fields.map(field => item[field] ?? null));
+      const before = value(base), mine = value(local), theirs = value(remote);
+      if (mine === before) continue;
+      if (theirs !== before && mine !== theirs) return null;
+      for (const field of fields) {
+        if (Object.hasOwn(local, field)) result[field] = clone(local[field]);
+        else delete result[field];
+      }
+    }
+    result.updatedAt = timestamp();
+    return result;
   }
 
   function mergeCollection(baseItems, localItems, remoteItems, kind) {
@@ -300,6 +320,8 @@
       } else if (!theirChanged || signature(mine, kind) === signature(theirs, kind)) {
         if (mine) output.push(clone(mine));
       } else {
+        const combinedPage = kind === "page" ? mergePageFields(old, mine, theirs) : null;
+        if (combinedPage) { output.push(combinedPage); continue; }
         conflicts++;
         if (theirs) output.push(clone(theirs));
         if (mine) {
@@ -345,7 +367,7 @@
     }
 
     if (!pages.length) {
-      pages.push({ id: "page-1", name: "第 1 页", width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT,
+      pages.push({ id: "page-1", name: "第 1 页", ...Paper.createSettings(),
         createdAt: timestamp(), updatedAt: timestamp() });
       pageIds.add("page-1");
     }

@@ -8,17 +8,37 @@
   const UI_ONLY = ".drag-handle,.width-handle,.resize-handle,.touch-edge-handle,.conflict-badge,[data-export-ignore]";
   const PAGE_WIDTH = 794, PAGE_HEIGHT = 1123;
   const DEFAULT_SCALE = 3;
+  const MAX_PIXELS = 20000000;
 
   function assertCurrent(isCurrent) {
     if (typeof isCurrent === "function" && !isCurrent()) throw new DOMException("导出已取消。", "AbortError");
   }
 
   function dimensions(page) {
-    const width = Number(page?.width) || PAGE_WIDTH, height = Number(page?.height) || PAGE_HEIGHT;
-    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 4000 || height > 4000) {
+    const paper = window.OnePagePaper?.resolve(page);
+    const width = Number(paper?.width ?? page?.width) || PAGE_WIDTH, height = Number(paper?.height ?? page?.height) || PAGE_HEIGHT;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 5000 || height > 5000) {
       throw new Error("纸张尺寸无效，无法导出。");
     }
-    return { width, height };
+    const legacyA4 = width === PAGE_WIDTH && height === PAGE_HEIGHT;
+    const legacyLandscapeA4 = width === PAGE_HEIGHT && height === PAGE_WIDTH;
+    const paperWidthMm = Number(paper?.paperWidthMm ?? page?.paperWidthMm) || (legacyA4 ? 210 : legacyLandscapeA4 ? 297 : width * 25.4 / 96);
+    const paperHeightMm = Number(paper?.paperHeightMm ?? page?.paperHeightMm) || (legacyA4 ? 297 : legacyLandscapeA4 ? 210 : height * 25.4 / 96);
+    if (!Number.isFinite(paperWidthMm) || !Number.isFinite(paperHeightMm) || paperWidthMm <= 0 || paperHeightMm <= 0) {
+      throw new Error("纸张尺寸无效，无法导出。");
+    }
+    const candidateColor = paper?.paperColor ?? page?.paperColor;
+    const paperColor = /^#[0-9a-f]{6}$/i.test(candidateColor) ? candidateColor : "#ffffff";
+    return { width, height, paperWidthMm, paperHeightMm, paperColor };
+  }
+
+  function resolution(width, height, scale) {
+    scale = Number(scale);
+    if (!Number.isFinite(scale) || scale < 1 || scale > 4) throw new Error("导出分辨率无效，请选择 1 至 4 倍分辨率。");
+    // Large papers keep their full content. Lower the raster resolution rather
+    // than allocating an unbounded canvas or rejecting a valid paper format.
+    const safeScale = Math.min(scale, Math.sqrt(MAX_PIXELS / (width * height)));
+    return { outputWidth: Math.max(1, Math.floor(width * safeScale)), outputHeight: Math.max(1, Math.floor(height * safeScale)) };
   }
 
   function imageData(image) {
@@ -91,11 +111,8 @@
   async function render({ canvas, page, scale = DEFAULT_SCALE, isCurrent } = {}) {
     assertCurrent(isCurrent);
     if (!(canvas instanceof Element) || !canvas.isConnected) throw new Error("请先打开要导出的纸张。");
-    const { width, height } = dimensions(page);
-    scale = Number(scale);
-    if (!Number.isFinite(scale) || scale < 1 || scale > 4 || width * height * scale * scale > 20000000) {
-      throw new Error("导出分辨率过大，请选择较低分辨率。");
-    }
+    const { width, height, paperColor } = dimensions(page);
+    const { outputWidth, outputHeight } = resolution(width, height, scale);
     if (document.fonts?.ready) await document.fonts.ready;
     assertCurrent(isCurrent);
     for (const slot of canvas.querySelectorAll("[data-onepage-asset]")) {
@@ -104,18 +121,18 @@
     }
     const copy = clonePaintedNode(canvas);
     Object.assign(copy.style, { position: "relative", inset: "auto", left: "auto", top: "auto", width: `${width}px`, height: `${height}px`,
-      margin: "0", transform: "none", transformOrigin: "top left", overflow: "hidden", background: "#fff", border: "0", outline: "none" });
+      margin: "0", transform: "none", transformOrigin: "top left", overflow: "hidden", background: paperColor, border: "0", outline: "none" });
     copy.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
     const markup = new XMLSerializer().serializeToString(copy);
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><foreignObject x="0" y="0" width="${width}" height="${height}">${markup}</foreignObject></svg>`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"><foreignObject x="0" y="0" width="${width}" height="${height}">${markup}</foreignObject></svg>`;
     const image = await loadSvg(svg);
     assertCurrent(isCurrent);
     const output = document.createElement("canvas");
-    output.width = Math.round(width * scale);
-    output.height = Math.round(height * scale);
+    output.width = outputWidth;
+    output.height = outputHeight;
     const context = output.getContext("2d", { alpha: false });
     if (!context) throw new Error("此浏览器无法创建导出图片。");
-    context.fillStyle = "#fff";
+    context.fillStyle = paperColor;
     context.fillRect(0, 0, output.width, output.height);
     context.drawImage(image, 0, 0, output.width, output.height);
     return output;
@@ -125,19 +142,17 @@
     return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("无法生成导出文件，请重试。")), type, quality));
   }
 
-  function pdfFromJpeg(bytes, width, height) {
+  function pdfFromJpeg(bytes, width, height, paper) {
     // ISO 32000-1:2008, sections 7.5 (file structure), 8.9 (image XObjects),
     // and 14.11.2 (page boundaries). One PDF point is 1/72 inch; the MediaBox
-    // below is exactly 210 by 297 mm. The JPEG retains the rendered A4 layout.
+    // comes from the chosen paper's physical dimensions. The JPEG fills that
+    // page, so landscape and custom papers keep their actual aspect ratio.
     const encoder = new TextEncoder();
     const chunks = [], offsets = [0];
     let length = 0;
     const append = value => { const chunk = typeof value === "string" ? encoder.encode(value) : value; chunks.push(chunk); length += chunk.length; };
     const object = (id, body) => { offsets[id] = length; append(`${id} 0 obj\n${body}\nendobj\n`); };
-    const pageWidth = 210 * 72 / 25.4, pageHeight = 297 * 72 / 25.4;
-    const fit = Math.min(pageWidth / width, pageHeight / height);
-    const imageWidth = width * fit, imageHeight = height * fit;
-    const left = (pageWidth - imageWidth) / 2, bottom = (pageHeight - imageHeight) / 2;
+    const pageWidth = paper.paperWidthMm * 72 / 25.4, pageHeight = paper.paperHeightMm * 72 / 25.4;
     append("%PDF-1.4\n");
     append(new Uint8Array([37, 226, 227, 207, 211, 10]));
     object(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -147,7 +162,7 @@
     append(`4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${bytes.length} >>\nstream\n`);
     append(bytes);
     append("\nendstream\nendobj\n");
-    const commands = `q\n${imageWidth.toFixed(6)} 0 0 ${imageHeight.toFixed(6)} ${left.toFixed(6)} ${bottom.toFixed(6)} cm\n/Paper Do\nQ\n`;
+    const commands = `q\n${pageWidth.toFixed(6)} 0 0 ${pageHeight.toFixed(6)} 0 0 cm\n/Paper Do\nQ\n`;
     object(5, `<< /Length ${encoder.encode(commands).length} >>\nstream\n${commands}endstream`);
     const crossReference = length;
     append("xref\n0 6\n0000000000 65535 f \n");
@@ -160,7 +175,8 @@
     assertCurrent(options.isCurrent);
     const format = String(options.format || "png").toLowerCase();
     if (!["png", "pdf"].includes(format)) throw new Error("请选择 PNG 或 PDF 格式。");
-    const output = await render(options);
+    const paper = dimensions(options.page);
+    const output = await render({ ...options, page: paper });
     try {
       assertCurrent(options.isCurrent);
       if (format === "png") {
@@ -172,7 +188,7 @@
       assertCurrent(options.isCurrent);
       const bytes = new Uint8Array(await jpeg.arrayBuffer());
       assertCurrent(options.isCurrent);
-      return pdfFromJpeg(bytes, output.width, output.height);
+      return pdfFromJpeg(bytes, output.width, output.height, paper);
     } finally {
       output.width = output.height = 0;
     }

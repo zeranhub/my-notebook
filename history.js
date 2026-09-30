@@ -5,7 +5,8 @@
   const MAX_BYTES = 4 * 1024 * 1024;
   const NOTE_FIELDS = ["pageId", "content", "contentScale", "layer", "x", "y", "w", "h",
     "manualSize", "manualPosition", "conflictOf", "legacyTags"];
-  const PAGE_FIELDS = ["name", "width", "height", "conflictOf"];
+  const PAPER_SIZE_FIELDS = ["width", "height", "paperWidthMm", "paperHeightMm", "paperPreset"];
+  const PAGE_FIELDS = ["name", "paperSize", "paperColor", "conflictOf"];
   const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
   const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
   const equal = (a, b) => a === b || JSON.stringify(a) === JSON.stringify(b);
@@ -13,6 +14,8 @@
   const scale = value => Number.isFinite(value) && value >= 0.25 && value <= 8 ? value : 1;
 
   function valueAt(item, field) {
+    if (field === "paperSize") return { present: true, value: Object.fromEntries(
+      PAPER_SIZE_FIELDS.map(key => [key, { present: own(item, key), value: clone(item?.[key]) }])) };
     if (field === "contentScale") return { present: true, value: scale(item?.contentScale) };
     if (field === "layer") return { present: true,
       value: Number.isSafeInteger(item?.layer) && item.layer >= 0 ? item.layer : 0 };
@@ -196,6 +199,14 @@
         // cannot change width while leaving the content scale unchanged.
         if (!matches) { conflicts++; continue; }
         for (const [field, desired] of updates) {
+          if (field === "paperSize") {
+            for (const key of PAPER_SIZE_FIELDS) {
+              const dimension = desired.value[key];
+              if (dimension.present) item[key] = clone(dimension.value);
+              else delete item[key];
+            }
+            continue;
+          }
           if (desired.present) item[field] = clone(desired.value);
           else delete item[field];
         }
